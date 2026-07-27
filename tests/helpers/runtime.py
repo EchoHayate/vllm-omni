@@ -288,6 +288,17 @@ class OmniServer:
 
         max_wait = 1200
         start_time = time.time()
+        try:
+            self._await_server_ready(max_wait, startup_t0, start_time)
+        except BaseException:
+            # __enter__ raising means __exit__ never runs — reap the server's
+            # process tree here or its engine workers keep their GPU memory
+            # and poison every later test in the job.
+            if self.proc is not None:
+                self._kill_process_tree(self.proc.pid)
+            raise
+
+    def _await_server_ready(self, max_wait: float, startup_t0: float, start_time: float) -> None:
         while time.time() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
@@ -669,6 +680,19 @@ class OmniServerStageCli(OmniServer):
                 )
 
     def _start_server(self) -> None:
+        try:
+            self._start_stages_and_await_ready()
+        except BaseException:
+            # A stage dying during startup (or a startup timeout) raises out
+            # of __enter__, so __exit__ never runs. Reap the sibling stage
+            # processes that DID come up here — a leaked stage engine keeps
+            # tens of GiB of GPU memory and OOMs every later test in the job
+            # (see nightly "Omni · Function Test with H100" cascade).
+            self._dump_stage_logs_for_debug()
+            self._shutdown_stage_procs()
+            raise
+
+    def _start_stages_and_await_ready(self) -> None:
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
@@ -699,6 +723,12 @@ class OmniServerStageCli(OmniServer):
             time.sleep(2)
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
+
+    def _shutdown_stage_procs(self) -> None:
+        for stage_key in sorted(self.stage_procs, reverse=True):
+            proc = self.stage_procs[stage_key]
+            if proc.poll() is None:
+                self._kill_process_tree(proc.pid)
 
     def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
         """Tail each stage's subprocess log back to stdout on teardown.
@@ -740,10 +770,7 @@ class OmniServerStageCli(OmniServer):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._dump_stage_logs_for_debug()
-        for stage_key in sorted(self.stage_procs, reverse=True):
-            proc = self.stage_procs[stage_key]
-            if proc.poll() is None:
-                self._kill_process_tree(proc.pid)
+        self._shutdown_stage_procs()
         run_pre_test_cleanup()
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
