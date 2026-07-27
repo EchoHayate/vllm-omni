@@ -1265,9 +1265,16 @@ def get_headless_replica_devices(
 
 
 def wait_for_manager_liveness(engine_managers: list[Any]) -> None:
-    """Block until one or more engine managers report process exit."""
+    """Block until one or more engine managers report process exit.
+
+    Raises when any engine core process died with a non-zero exit code so the
+    headless CLI process itself exits non-zero. Without this, a fatal engine
+    error (e.g. OOM during startup) surfaced to launchers as the stage
+    "exited with code 0", masking the failure.
+    """
     if len(engine_managers) == 1:
         engine_managers[0].monitor_engine_liveness()
+        _raise_on_failed_engines(engine_managers)
         return
 
     def _monitor_target(mgr: Any) -> None:
@@ -1287,6 +1294,19 @@ def wait_for_manager_liveness(engine_managers: list[Any]) -> None:
         monitor_threads.append(t)
     for t in monitor_threads:
         t.join()
+    _raise_on_failed_engines(engine_managers)
+
+
+def _raise_on_failed_engines(engine_managers: list[Any]) -> None:
+    """Surface engine core processes that died with a non-zero exit code.
+
+    ``CoreEngineProcManager.monitor_engine_liveness`` records the failure in
+    ``failed_proc_name`` and returns normally; it is the caller's job to turn
+    that into a non-zero process exit.
+    """
+    failed = [name for mgr in engine_managers if (name := getattr(mgr, "failed_proc_name", None))]
+    if failed:
+        raise RuntimeError(f"Engine core process(es) died: {', '.join(failed)}")
 
 
 def wait_for_diffusion_manager_liveness(managers: list[Any]) -> None:
