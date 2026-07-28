@@ -1304,7 +1304,12 @@ def _raise_on_failed_engines(engine_managers: list[Any]) -> None:
     ``failed_proc_name`` and returns normally; it is the caller's job to turn
     that into a non-zero process exit.
     """
-    failed = [name for mgr in engine_managers if (name := getattr(mgr, "failed_proc_name", None))]
+    # failed_proc_name is duck-typed off CoreEngineProcManager; managers that
+    # don't track liveness (diffusion SimpleNamespace stubs, test doubles) may
+    # expose a non-str attribute, which must not count as a failure.
+    failed = [
+        name for mgr in engine_managers if isinstance((name := getattr(mgr, "failed_proc_name", None)), str) and name
+    ]
     if failed:
         raise RuntimeError(f"Engine core process(es) died: {', '.join(failed)}")
 

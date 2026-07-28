@@ -230,6 +230,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     )
     vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
     engine_manager = mocker.Mock()
+    engine_manager.failed_proc_name = None
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -305,7 +306,9 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     )
     vllm_config = SimpleNamespace(parallel_config=parallel_config, needs_dp_coordinator=False)
     manager_a = mocker.Mock()
+    manager_a.failed_proc_name = None
     manager_b = mocker.Mock()
+    manager_b.failed_proc_name = None
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -484,3 +487,19 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
 
     with pytest.raises(RuntimeError, match=r"exited with code 137"):
         run_headless(_make_headless_args(stage_id=1))
+
+
+def test_raise_on_failed_engines_surfaces_real_failures_and_ignores_non_str() -> None:
+    """A recorded failure name must raise; liveness-agnostic managers whose
+    ``failed_proc_name`` is absent, ``None``, or a non-str stub must not."""
+    from vllm_omni.engine.stage_engine_startup import _raise_on_failed_engines
+
+    healthy = SimpleNamespace(failed_proc_name=None)
+    no_attr = SimpleNamespace()
+    non_str_stub = SimpleNamespace(failed_proc_name=object())
+
+    _raise_on_failed_engines([healthy, no_attr, non_str_stub])
+
+    failed = SimpleNamespace(failed_proc_name="EngineCore_0")
+    with pytest.raises(RuntimeError, match=r"EngineCore_0"):
+        _raise_on_failed_engines([healthy, failed])
