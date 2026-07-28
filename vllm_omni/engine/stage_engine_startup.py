@@ -1277,11 +1277,15 @@ def wait_for_manager_liveness(engine_managers: list[Any]) -> None:
         _raise_on_failed_engines(engine_managers)
         return
 
+    first_exit = threading.Event()
+
     def _monitor_target(mgr: Any) -> None:
         try:
             mgr.monitor_engine_liveness()
         except Exception:
             logger.exception("[Headless] monitor_engine_liveness raised")
+        finally:
+            first_exit.set()
 
     monitor_threads: list[threading.Thread] = []
     for mgr in engine_managers:
@@ -1289,11 +1293,23 @@ def wait_for_manager_liveness(engine_managers: list[Any]) -> None:
             target=_monitor_target,
             args=(mgr,),
             name=f"omni-replica-monitor-{id(mgr):x}",
+            daemon=True,
         )
         t.start()
         monitor_threads.append(t)
+    # React to the FIRST manager whose engines exited: a healthy sibling's
+    # monitor never returns, so joining every thread unconditionally would
+    # block forever and a recorded failure would never surface. Shut the
+    # remaining managers down to unblock their monitors, then join (bounded)
+    # and raise on any recorded failure.
+    first_exit.wait()
+    for mgr in engine_managers:
+        try:
+            mgr.shutdown()
+        except Exception:
+            logger.exception("[Headless] manager shutdown after first replica exit raised")
     for t in monitor_threads:
-        t.join()
+        t.join(timeout=30)
     _raise_on_failed_engines(engine_managers)
 
 

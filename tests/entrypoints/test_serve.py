@@ -354,8 +354,11 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     # Multi-replica path joins the monitor threads instead of calling
     # ``monitor_engine_liveness`` synchronously on the main thread, but every
     # manager must still be shut down in the finally block.
-    manager_a.shutdown.assert_called_once_with()
-    manager_b.shutdown.assert_called_once_with()
+    # Shutdown is idempotent and fires both from the liveness wait (to
+    # unblock sibling monitors) and the launcher's finally — assert it
+    # happened, not how many times.
+    assert manager_a.shutdown.called
+    assert manager_b.shutdown.called
 
 
 def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture) -> None:
@@ -503,3 +506,43 @@ def test_raise_on_failed_engines_surfaces_real_failures_and_ignores_non_str() ->
     failed = SimpleNamespace(failed_proc_name="EngineCore_0")
     with pytest.raises(RuntimeError, match=r"EngineCore_0"):
         _raise_on_failed_engines([healthy, failed])
+
+
+def test_wait_for_manager_liveness_surfaces_failure_despite_healthy_sibling() -> None:
+    """P1 regression: with multiple managers, one dead engine plus a healthy
+    sibling (whose monitor never returns on its own) must still raise — the
+    liveness wait reacts to the first exited monitor and shuts the sibling
+    down to unblock it, rather than joining every monitor unconditionally."""
+    import threading
+
+    from vllm_omni.engine.stage_engine_startup import wait_for_manager_liveness
+
+    class _DeadManager:
+        failed_proc_name = "EngineCore_dead"
+
+        def monitor_engine_liveness(self) -> None:
+            return  # engines already exited
+
+        def shutdown(self) -> None:
+            pass
+
+    class _HealthyManager:
+        failed_proc_name = None
+
+        def __init__(self) -> None:
+            self._stop = threading.Event()
+            self.shutdown_called = False
+
+        def monitor_engine_liveness(self) -> None:
+            # Blocks like a real monitor over healthy engines; only shutdown
+            # releases it.
+            self._stop.wait(timeout=30)
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+            self._stop.set()
+
+    healthy = _HealthyManager()
+    with pytest.raises(RuntimeError, match="EngineCore_dead"):
+        wait_for_manager_liveness([_DeadManager(), healthy])
+    assert healthy.shutdown_called
