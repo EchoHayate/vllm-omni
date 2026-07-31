@@ -266,6 +266,7 @@ def apply_rotary_emb_qwen(
 class QwenImagePipeline(
     nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
+    packed_modules_mapping = QwenImageTransformer2DModel.packed_modules_mapping
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
