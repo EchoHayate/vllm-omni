@@ -2,6 +2,23 @@
 
 This document explains how to configure the RDMA environment and run tests for `MooncakeTransferEngineConnector`.
 
+## Async KV Prefetch H2D Benchmark
+
+Measure how quickly a background KV prefetch future becomes available while its
+H2D copy continues on the dedicated copy stream:
+
+```bash
+python benchmarks/distributed/omni_connectors/benchmark_async_prefetch_h2d.py \
+    --device cuda:0 \
+    --size-mib 256 \
+    --warmup 3 \
+    --iterations 20
+```
+
+`event_future_ready` is the event-based submission latency.
+`blocking_future_ready` includes waiting for the same copy event and models the
+previous future-ready behavior.
+
 ## Table of Contents
 
 - [Docker Container Permissions](#docker-container-permissions)
