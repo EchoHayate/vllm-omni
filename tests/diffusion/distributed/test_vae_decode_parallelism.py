@@ -32,7 +32,7 @@ PROMPT = "A cat sitting on a table"
 MODEL_CASES = [
     pytest.param(
         {
-            "model_name": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "model_name": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
             "height": 512,
             "width": 512,
             "num_frames": 5,
@@ -41,7 +41,7 @@ MODEL_CASES = [
             "mean_threshold": 3e-2,
             "p99_threshold": 3e-2,
         },
-        id="wan22_t2v_a14b",
+        id="wan22_ti2v_5b",
     ),
     pytest.param(
         {
