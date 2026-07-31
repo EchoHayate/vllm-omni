@@ -8,7 +8,7 @@ import struct
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import torch
@@ -45,6 +45,17 @@ LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 class KVPrefetchConsumeError(RuntimeError):
     """Payload consumed from connector but post-get processing failed — sync retry impossible."""
+
+
+@dataclass
+class _PrefetchedKV:
+    """A prefetched payload plus the resources backing its asynchronous H2D copy."""
+
+    data: dict[str, Any] | None
+    size: int
+    ready_event: Any | None = None
+    source_tensors: list[torch.Tensor] = field(default_factory=list)
+    pool_buffers: list[Any] = field(default_factory=list)
 
 
 class ReceiveRole(enum.Enum):
@@ -405,6 +416,7 @@ class OmniKVTransferManager:
         )
         self._prefetch_futures: dict[str, Any] = {}
         self._bg_copy_stream: current_omni_platform.Stream | None = None
+        self._pending_prefetch_releases: list[_PrefetchedKV] = []
 
         self._topo_config: _TransferTopoConfig | None = None
 
@@ -1208,6 +1220,7 @@ class OmniKVTransferManager:
 
     def start_prefetch(self, kv_prefetch_job: KVPrefetchJob | None, target_device: torch.device | None = None) -> None:
         """Kick off a background KV load (non-blocking). No-op unless prefetch enabled."""
+        self._drain_prefetch_releases()
         if not (self._async_prefetch and self.config.need_recv_cache) or not kv_prefetch_job:
             return
         # Followers receive via collective distribute; bg pull would consume the owner's payload.
@@ -1244,11 +1257,14 @@ class OmniKVTransferManager:
         request_id: str,
         sender_info: dict[str, Any] | None,
         target_device: torch.device | None,
-    ) -> tuple[dict[str, Any] | None, int]:
+    ) -> _PrefetchedKV:
         """Bg-thread body: get + deserialize + H2D on the dedicated ``_bg_copy_stream``.
 
         Raises on failure (payload may be consumed → no sync retry).
         """
+        source_tensors: list[torch.Tensor] = []
+        pool_buffers: list[Any] = []
+        payload_consumed = False
         try:
             on_device = target_device is not None and target_device.type != "cpu"
             if on_device:
@@ -1259,19 +1275,52 @@ class OmniKVTransferManager:
                     self._bg_copy_stream = current_omni_platform.Stream()
                 with current_omni_platform.stream(self._bg_copy_stream):
                     data, size = self.receive_kv_cache_for_request(
-                        request_id, target_device=target_device, sender_info=sender_info
+                        request_id,
+                        target_device=target_device,
+                        sender_info=sender_info,
+                        non_blocking_copy=True,
+                        copy_stream=self._bg_copy_stream,
+                        deferred_copy_sources=source_tensors,
+                        deferred_pool_buffers=pool_buffers,
                     )
+                    payload_consumed = data is not None
+                    if data is not None:
+                        ready_event = current_omni_platform.Event()
+                        ready_event.record(self._bg_copy_stream)
+                    else:
+                        ready_event = None
             else:
                 data, size = self.receive_kv_cache_for_request(
                     request_id, target_device=target_device, sender_info=sender_info
                 )
-        except Exception:
+                payload_consumed = data is not None
+                ready_event = None
+        except Exception as exc:
+            if source_tensors or pool_buffers:
+                try:
+                    if self._bg_copy_stream is not None:
+                        self._bg_copy_stream.synchronize()
+                finally:
+                    source_tensors.clear()
+                    self._release_pool_buffers(pool_buffers)
             logger.exception("KV prefetch payload failed for %s (payload may be lost)", request_id)
+            if payload_consumed and not isinstance(exc, KVPrefetchConsumeError):
+                raise KVPrefetchConsumeError(
+                    f"Post-get prefetch setup failed for {request_id} (payload already consumed)"
+                ) from exc
             raise
 
         if data is None:
-            return None, 0
-        return data, size
+            source_tensors.clear()
+            self._release_pool_buffers(pool_buffers)
+            return _PrefetchedKV(data=None, size=0)
+        return _PrefetchedKV(
+            data=data,
+            size=size,
+            ready_event=ready_event,
+            source_tensors=source_tensors,
+            pool_buffers=pool_buffers,
+        )
 
     def consume_prefetched_kv(self, req: Any) -> tuple[dict[str, Any] | None, int]:
         """Consume a prefetched KV payload; (None, 0) on miss/recoverable failure.
@@ -1282,16 +1331,40 @@ class OmniKVTransferManager:
         if not request_id:
             return None, 0
 
+        self._drain_prefetch_releases()
         fut = self._prefetch_futures.pop(request_id, None)
         # Serial mode: any other request still in the table is an orphan — drop it.
         for stale_rid in list(self._prefetch_futures):
             self._discard_future(stale_rid)
 
         if fut is None:
+            self._drain_prefetch_releases(wait=True)
             return None, 0
 
         try:
-            return fut.result()
+            result = fut.result()
+            if not isinstance(result, _PrefetchedKV):
+                return result
+            if result.ready_event is not None:
+                try:
+                    current_stream = current_omni_platform.current_stream()
+                    current_stream.wait_event(result.ready_event)
+                    if result.data is not None:
+                        self._record_stream_for_prefetched(result.data)
+                except Exception as exc:
+                    if not self._release_prefetch_result(result, wait=True):
+                        self._pending_prefetch_releases.append(result)
+                    raise KVPrefetchConsumeError(
+                        f"Failed to establish stream dependency for prefetched KV {request_id}"
+                    ) from exc
+                if result.source_tensors or result.pool_buffers:
+                    self._pending_prefetch_releases.append(result)
+                self._drain_prefetch_releases()
+            else:
+                self._release_prefetch_result(result)
+                if result.data is None:
+                    self._drain_prefetch_releases(wait=True)
+            return result.data, result.size
         except KVPrefetchConsumeError:
             logger.exception("KV load failed for %s (payload consumed, cannot retry)", request_id)
             raise
@@ -1305,7 +1378,50 @@ class OmniKVTransferManager:
         if fut is None:
             return
         if not fut.cancel():
-            fut.add_done_callback(_drop_prefetch_result)
+            fut.add_done_callback(self._drop_prefetch_result)
+
+    def _drop_prefetch_result(self, fut: Any) -> None:
+        try:
+            if fut.cancelled():
+                return
+            result = fut.result()
+        except Exception:
+            return
+        if isinstance(result, _PrefetchedKV):
+            if not self._release_prefetch_result(result, wait=True):
+                self._pending_prefetch_releases.append(result)
+
+    def _release_prefetch_result(self, result: _PrefetchedKV, *, wait: bool = False) -> bool:
+        if wait and result.ready_event is not None:
+            try:
+                result.ready_event.synchronize()
+            except Exception:
+                logger.exception("Failed to synchronize KV prefetch before releasing its source")
+                return False
+        result.source_tensors.clear()
+        self._release_pool_buffers(result.pool_buffers)
+        return True
+
+    def _drain_prefetch_releases(self, *, wait: bool = False) -> None:
+        pending = self._pending_prefetch_releases
+        self._pending_prefetch_releases = []
+        for result in pending:
+            ready = result.ready_event is None
+            if not ready and wait:
+                try:
+                    result.ready_event.synchronize()
+                    ready = True
+                except Exception:
+                    logger.exception("Failed to synchronize pending KV prefetch release")
+            elif not ready:
+                try:
+                    ready = result.ready_event.query()
+                except Exception:
+                    logger.exception("Failed to query pending KV prefetch release")
+            if ready:
+                self._release_prefetch_result(result)
+            else:
+                self._pending_prefetch_releases.append(result)
 
     def shutdown_prefetch(self) -> None:
         """Cancel pending prefetches and stop the executor (call on teardown)."""
@@ -1317,6 +1433,7 @@ class OmniKVTransferManager:
             except Exception:
                 logger.exception("Failed to shut down KV prefetch executor")
             self._prefetch_executor = None
+        self._drain_prefetch_releases(wait=True)
 
     @staticmethod
     def _record_stream_for_prefetched(data: dict[str, Any]) -> None:
@@ -1342,6 +1459,10 @@ class OmniKVTransferManager:
         target_device: torch.device | None = None,
         *,
         sender_info: dict[str, Any] | None = None,
+        non_blocking_copy: bool = False,
+        copy_stream: Any | None = None,
+        deferred_copy_sources: list[torch.Tensor] | None = None,
+        deferred_pool_buffers: list[Any] | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
         """Receive KV cache for *request_id*; returns (data dict, size) or (None, 0).
 
@@ -1377,6 +1498,14 @@ class OmniKVTransferManager:
         pending_pairs = list(recv_key_pairs)
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
         deferred_memory: list[Any] = []
+        copy_sources: list[torch.Tensor] = []
+
+        if non_blocking_copy and copy_stream is None:
+            raise ValueError("copy_stream is required for non-blocking KV cache copies")
+        if (deferred_copy_sources is not None or deferred_pool_buffers is not None) and not non_blocking_copy:
+            raise ValueError("deferred copy resources require non-blocking KV cache copies")
+        if (deferred_copy_sources is None) != (deferred_pool_buffers is None):
+            raise ValueError("deferred copy sources and pool buffers must be provided together")
 
         # Per-call sender_info takes precedence over instance fields.
         if sender_info is not None:
@@ -1474,7 +1603,14 @@ class OmniKVTransferManager:
                                     if not isinstance(tensor, torch.Tensor):
                                         continue
                                     if target_device is not None and tensor.device != target_device:
-                                        cache_list[i] = tensor.to(target_device).contiguous()
+                                        if non_blocking_copy:
+                                            copy_sources.append(tensor)
+                                            cache_list[i] = tensor.to(
+                                                target_device,
+                                                non_blocking=True,
+                                            ).contiguous()
+                                        else:
+                                            cache_list[i] = tensor.to(target_device).contiguous()
                                     elif needs_clone:
                                         cache_list[i] = tensor.clone()
                     except Exception as exc:
@@ -1491,6 +1627,12 @@ class OmniKVTransferManager:
                         elapsed,
                         link_ms,
                     )
+                    if deferred_copy_sources is not None:
+                        deferred_copy_sources.extend(copy_sources)
+                        copy_sources.clear()
+                    if deferred_pool_buffers is not None:
+                        deferred_pool_buffers.extend(deferred_memory)
+                        deferred_memory.clear()
                     return data, total_size
 
                 if time.time() - start_time > timeout:
@@ -1506,7 +1648,11 @@ class OmniKVTransferManager:
             logger.exception("Error receiving KV cache for %s", request_id)
             return None, 0
         finally:
-            self._release_pool_buffers(deferred_memory)
+            try:
+                if copy_sources:
+                    copy_stream.synchronize()
+            finally:
+                self._release_pool_buffers(deferred_memory)
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
         """Apply received KV cache data to a request object.
@@ -1770,7 +1916,6 @@ class OmniKVTransferManager:
             try:
                 data, _ = self.consume_prefetched_kv(req)
                 if data is not None:
-                    self._record_stream_for_prefetched(data)
                     self.apply_kv_cache_to_request(req, data)
                     received = True
             except KVPrefetchConsumeError:
@@ -1847,14 +1992,6 @@ class OmniKVTransferManager:
             kv_payload = self._collect_request_kv_payload(req)
         kv_payload = self._broadcast_kv_payload(pt.world, kv_payload, device, src=0)
         return kv_payload or None
-
-
-def _drop_prefetch_result(fut: Any) -> None:
-    try:
-        if not fut.cancelled():
-            fut.result()
-    except Exception:
-        pass
 
 
 def _move_to_device(obj: object, device: torch.device) -> object:

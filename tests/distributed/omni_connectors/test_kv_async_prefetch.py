@@ -5,6 +5,8 @@ mock connector, dedup, per-call sender_info isolation, role classification, and
 miss/abort paths.  GPU H2D and D2D paths need CUDA (integration tests).
 """
 
+from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +14,11 @@ import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    KVPrefetchConsumeError,
     OmniKVCacheConfig,
     OmniKVTransferManager,
     ReceiveRole,
+    _PrefetchedKV,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -338,8 +342,10 @@ def test_start_prefetch_submits_for_owner(monkeypatch):
     _seed_payload(sender, "rid-own")
     _set_tp(receiver, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=0)
+    monkeypatch.setattr(receiver, "_prefetch_payload", lambda *_args: _PrefetchedKV(data=None, size=0))
     receiver.start_prefetch({"request_id": "rid-own", "kv_sender_info": _SENDER_INFO})
     assert "rid-own" in receiver._prefetch_futures
+    receiver.shutdown_prefetch()
 
 
 def test_consume_then_apply_attaches_payload():
@@ -354,3 +360,339 @@ def test_consume_then_apply_attaches_payload():
     receiver._record_stream_for_prefetched(data)
     receiver.apply_kv_cache_to_request(req, data)
     assert req.past_key_values is not None
+
+
+def test_gpu_prefetch_records_event_without_synchronizing(monkeypatch):
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+
+    class _CopyStream:
+        def synchronize(self):
+            raise AssertionError("successful prefetch must not synchronize the CPU")
+
+    class _Event:
+        def record(self, stream):
+            events.append(("record", stream))
+
+    fake_stream = _CopyStream()
+    captured = {}
+
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda _index: None)
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.Stream",
+        lambda: fake_stream,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.stream",
+        lambda _stream: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.Event",
+        _Event,
+    )
+
+    def fake_receive(request_id, target_device=None, **kwargs):
+        captured.update(
+            request_id=request_id,
+            target_device=target_device,
+            **kwargs,
+        )
+        kwargs["deferred_pool_buffers"].append(pool_buffer)
+        return {"layer_blocks": {}}, 1
+
+    monkeypatch.setattr(receiver, "receive_kv_cache_for_request", fake_receive)
+
+    result = receiver._prefetch_payload(
+        "rid-gpu",
+        _SENDER_INFO,
+        torch.device("cuda:0"),
+    )
+
+    assert result.data is not None
+    assert result.size == 1
+    assert result.pool_buffers == [pool_buffer]
+    assert captured["non_blocking_copy"] is True
+    assert captured["deferred_pool_buffers"] is result.pool_buffers
+    assert events == [("record", fake_stream)]
+
+
+def test_gpu_prefetch_event_failure_is_non_retryable_and_releases_after_sync(monkeypatch):
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+    source = torch.ones(1)
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+
+    class _CopyStream:
+        def synchronize(self):
+            events.append("synchronize")
+
+    class _Event:
+        def record(self, stream):
+            raise RuntimeError("record failed")
+
+    fake_stream = _CopyStream()
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda _index: None)
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.Stream",
+        lambda: fake_stream,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.stream",
+        lambda _stream: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.Event",
+        _Event,
+    )
+
+    def fake_receive(request_id, target_device=None, **kwargs):
+        kwargs["deferred_copy_sources"].append(source)
+        kwargs["deferred_pool_buffers"].append(pool_buffer)
+        return {"layer_blocks": {}}, 1
+
+    monkeypatch.setattr(receiver, "receive_kv_cache_for_request", fake_receive)
+
+    with pytest.raises(KVPrefetchConsumeError, match="payload already consumed"):
+        receiver._prefetch_payload(
+            "rid-gpu",
+            _SENDER_INFO,
+            torch.device("cuda:0"),
+        )
+
+    assert events == ["synchronize", "release"]
+
+
+def test_consume_waits_event_and_records_destination_stream(monkeypatch):
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+    ready_event = SimpleNamespace(query=lambda: False)
+    data = {"layer_blocks": {}}
+    future = Future()
+    future.set_result(_PrefetchedKV(data=data, size=7, ready_event=ready_event))
+    receiver._prefetch_futures["rid-gpu"] = future
+
+    class _ComputeStream:
+        def wait_event(self, event):
+            events.append(("wait_event", event))
+
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.current_stream",
+        lambda: _ComputeStream(),
+    )
+    monkeypatch.setattr(
+        receiver,
+        "_record_stream_for_prefetched",
+        lambda payload: events.append(("record_stream", payload)),
+    )
+
+    assert receiver.consume_prefetched_kv(_req("rid-gpu")) == (data, 7)
+    assert events == [
+        ("wait_event", ready_event),
+        ("record_stream", data),
+    ]
+
+
+def test_consumed_prefetch_releases_pool_buffer_after_event_completes():
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        completed = False
+
+        def query(self):
+            return self.completed
+
+    ready_event = _Event()
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    future = Future()
+    future.set_result(
+        _PrefetchedKV(
+            data={"layer_blocks": {}},
+            size=7,
+            ready_event=ready_event,
+            pool_buffers=[pool_buffer],
+        )
+    )
+    receiver._prefetch_futures["rid-gpu"] = future
+
+    receiver.consume_prefetched_kv(_req("rid-gpu"))
+    assert events == []
+    assert len(receiver._pending_prefetch_releases) == 1
+
+    receiver._drain_prefetch_releases()
+    assert events == []
+
+    ready_event.completed = True
+    receiver._drain_prefetch_releases()
+    assert events == ["release"]
+    assert receiver._pending_prefetch_releases == []
+
+
+@pytest.mark.parametrize("completed_miss", [False, True])
+def test_prefetch_miss_drains_pending_sources_before_sync_fallback(completed_miss):
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        def query(self):
+            return False
+
+        def synchronize(self):
+            events.append("synchronize")
+
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    receiver._pending_prefetch_releases.append(
+        _PrefetchedKV(
+            data={"layer_blocks": {}},
+            size=7,
+            ready_event=_Event(),
+            pool_buffers=[pool_buffer],
+        )
+    )
+    if completed_miss:
+        future = Future()
+        future.set_result(_PrefetchedKV(data=None, size=0))
+        receiver._prefetch_futures["not-prefetched"] = future
+
+    assert receiver.consume_prefetched_kv(_req("not-prefetched")) == (None, 0)
+    assert events == ["synchronize", "release"]
+    assert receiver._pending_prefetch_releases == []
+
+
+def test_consume_stream_dependency_failure_synchronizes_and_raises(monkeypatch):
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        def synchronize(self):
+            events.append("synchronize")
+
+    class _ComputeStream:
+        def wait_event(self, event):
+            raise RuntimeError("wait failed")
+
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    future = Future()
+    future.set_result(
+        _PrefetchedKV(
+            data={"layer_blocks": {}},
+            size=7,
+            ready_event=_Event(),
+            pool_buffers=[pool_buffer],
+        )
+    )
+    receiver._prefetch_futures["rid-gpu"] = future
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.current_stream",
+        lambda: _ComputeStream(),
+    )
+
+    with pytest.raises(KVPrefetchConsumeError, match="stream dependency"):
+        receiver.consume_prefetched_kv(_req("rid-gpu"))
+
+    assert events == ["synchronize", "release"]
+
+
+def test_discarded_prefetch_synchronizes_before_pool_buffer_release():
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        def synchronize(self):
+            events.append("synchronize")
+
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    future = Future()
+    future.set_result(
+        _PrefetchedKV(
+            data={"layer_blocks": {}},
+            size=7,
+            ready_event=_Event(),
+            pool_buffers=[pool_buffer],
+        )
+    )
+    receiver._prefetch_futures["rid-stale"] = future
+
+    receiver._discard_future("rid-stale")
+
+    assert events == ["synchronize", "release"]
+
+
+def test_discarded_prefetch_retains_source_when_event_sync_fails():
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        def synchronize(self):
+            raise RuntimeError("device error")
+
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    result = _PrefetchedKV(
+        data={"layer_blocks": {}},
+        size=7,
+        ready_event=_Event(),
+        pool_buffers=[pool_buffer],
+    )
+    future = Future()
+    future.set_result(result)
+    receiver._prefetch_futures["rid-stale"] = future
+
+    receiver._discard_future("rid-stale")
+
+    assert events == []
+    assert receiver._pending_prefetch_releases == [result]
+
+
+def test_shutdown_synchronizes_consumed_pending_release():
+    receiver = OmniKVTransferManager(
+        OmniKVCacheConfig(need_recv_cache=True),
+        async_prefetch=True,
+    )
+    events = []
+
+    class _Event:
+        def query(self):
+            return False
+
+        def synchronize(self):
+            events.append("synchronize")
+
+    pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
+    receiver._pending_prefetch_releases.append(
+        _PrefetchedKV(
+            data={"layer_blocks": {}},
+            size=7,
+            ready_event=_Event(),
+            pool_buffers=[pool_buffer],
+        )
+    )
+
+    receiver.shutdown_prefetch()
+
+    assert events == ["synchronize", "release"]
+    assert receiver._pending_prefetch_releases == []

@@ -590,6 +590,127 @@ def test_deferred_release_isolates_data_from_pool_buffer():
     assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
 
 
+def test_non_blocking_copy_defers_pool_buffer_release(monkeypatch):
+    payload, _ = _make_serialized_payload()
+    raw_array = bytearray(payload)
+    buf_tensor = torch.frombuffer(raw_array, dtype=torch.uint8)
+    events = []
+
+    class _ManagedBuffer:
+        @property
+        def tensor(self):
+            return buf_tensor
+
+        def release(self):
+            events.append("release")
+
+    class _Connector:
+        def get(self, from_stage, to_stage, get_key, metadata=None):
+            return _ManagedBuffer(), len(raw_array)
+
+    class _CopyStream:
+        def synchronize(self):
+            raise AssertionError("successful non-blocking copy must not synchronize")
+
+    original_to = torch.Tensor.to
+
+    def fake_to(tensor, *args, **kwargs):
+        events.append(("copy", kwargs.get("non_blocking")))
+        return tensor.clone()
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_to)
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            connector_config={"type": "mock"},
+            from_stage="sender",
+            stage_id="receiver",
+            need_recv_cache=True,
+            recv_timeout=1.0,
+        )
+    )
+    manager._connector = _Connector()
+    deferred_copy_sources = []
+    deferred_pool_buffers = []
+
+    try:
+        data, size = manager.receive_kv_cache_for_request(
+            "req-payload",
+            target_device=torch.device("cuda:0"),
+            non_blocking_copy=True,
+            copy_stream=_CopyStream(),
+            deferred_copy_sources=deferred_copy_sources,
+            deferred_pool_buffers=deferred_pool_buffers,
+        )
+    finally:
+        monkeypatch.setattr(torch.Tensor, "to", original_to)
+
+    assert data is not None
+    assert size > 0
+    assert ("copy", True) in events
+    assert events == [("copy", True)]
+    assert len(deferred_copy_sources) == 1
+    assert len(deferred_pool_buffers) == 1
+
+    deferred_copy_sources.clear()
+    deferred_pool_buffers[0].release()
+    assert events[-1] == "release"
+
+
+def test_non_blocking_copy_failure_syncs_before_pool_buffer_release(monkeypatch):
+    payload, _ = _make_serialized_payload()
+    raw_array = bytearray(payload)
+    buf_tensor = torch.frombuffer(raw_array, dtype=torch.uint8)
+    events = []
+
+    class _ManagedBuffer:
+        @property
+        def tensor(self):
+            return buf_tensor
+
+        def release(self):
+            events.append("release")
+
+    class _Connector:
+        def get(self, from_stage, to_stage, get_key, metadata=None):
+            return _ManagedBuffer(), len(raw_array)
+
+    class _CopyStream:
+        def synchronize(self):
+            events.append("synchronize")
+
+    original_to = torch.Tensor.to
+
+    def fake_to(tensor, *args, **kwargs):
+        events.append(("copy", kwargs.get("non_blocking")))
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_to)
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            connector_config={"type": "mock"},
+            from_stage="sender",
+            stage_id="receiver",
+            need_recv_cache=True,
+            recv_timeout=1.0,
+        )
+    )
+    manager._connector = _Connector()
+
+    try:
+        with pytest.raises(RuntimeError, match="payload already consumed"):
+            manager.receive_kv_cache_for_request(
+                "req-payload",
+                target_device=torch.device("cuda:0"),
+                non_blocking_copy=True,
+                copy_stream=_CopyStream(),
+            )
+    finally:
+        monkeypatch.setattr(torch.Tensor, "to", original_to)
+
+    assert ("copy", True) in events
+    assert events[-2:] == ["synchronize", "release"]
+
+
 def test_manager_extraction_no_connector(kv_config, common_constants):
     """Test extraction when connector is unavailable (should still return IDs)."""
     block_size = common_constants["block_size"]
