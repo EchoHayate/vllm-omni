@@ -5,7 +5,7 @@
 
 Compares ``vae_patch_parallel_size=2`` against ``vae_patch_parallel_size=1`` on
 TP=2 with VAE tiling enabled. Covers one video model (Wan 2.1 T2V 1.3B) and one
-image model (Qwen-Image). CUDA/ROCm-only (>=2 devices).
+lightweight Qwen-Image checkpoint. CUDA/ROCm-only (>=2 devices).
 """
 
 from __future__ import annotations
@@ -45,16 +45,16 @@ MODEL_CASES = [
     ),
     pytest.param(
         {
-            "model_name": "Qwen/Qwen-Image",
-            "height": 1152,
-            "width": 1152,
+            "model_name": "riverclouds/qwen_image_random",
+            "height": 512,
+            "width": 512,
             "num_frames": 1,
             "needs_image": False,
             "is_moe": False,
             "mean_threshold": 5e-3,
             "p99_threshold": 1e-1,
         },
-        id="qwen_image",
+        id="qwen_image_random",
     ),
 ]
 
