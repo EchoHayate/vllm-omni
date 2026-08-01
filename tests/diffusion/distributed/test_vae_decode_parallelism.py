@@ -4,8 +4,8 @@
 """VAE patch-parallel decode parity tests for diffusion models.
 
 Compares ``vae_patch_parallel_size=2`` against ``vae_patch_parallel_size=1`` on
-TP=2 with VAE tiling enabled. Covers one video model (Wan T2V) and one image
-model (Qwen-Image). CUDA/ROCm-only (>=2 devices).
+TP=2 with VAE tiling enabled. Covers one video model (Wan 2.1 T2V 1.3B) and one
+image model (Qwen-Image). CUDA/ROCm-only (>=2 devices).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ PROMPT = "A cat sitting on a table"
 MODEL_CASES = [
     pytest.param(
         {
-            "model_name": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            "model_name": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             "height": 512,
             "width": 512,
             "num_frames": 5,
@@ -41,7 +41,7 @@ MODEL_CASES = [
             "mean_threshold": 3e-2,
             "p99_threshold": 3e-2,
         },
-        id="wan22_ti2v_5b",
+        id="wan21_t2v_1_3b",
     ),
     pytest.param(
         {

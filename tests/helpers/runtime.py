@@ -2619,19 +2619,15 @@ class OmniRunner:
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         from vllm_omni.entrypoints.omni import Omni
 
-        try:
-            self.omni = Omni(
-                model=model_name,
-                log_stats=log_stats,
-                stage_init_timeout=stage_init_timeout,
-                batch_timeout=batch_timeout,
-                init_timeout=init_timeout,
-                stage_configs_path=stage_configs_path,
-                **kwargs,
-            )
-        except BaseException:
-            self._cleanup()
-            raise
+        self.omni = Omni(
+            model=model_name,
+            log_stats=log_stats,
+            stage_init_timeout=stage_init_timeout,
+            batch_timeout=batch_timeout,
+            init_timeout=init_timeout,
+            stage_configs_path=stage_configs_path,
+            **kwargs,
+        )
         startup_s = time.perf_counter() - startup_t0
         if log_stats:
             print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
@@ -2894,17 +2890,13 @@ class OmniRunner:
     def __enter__(self):
         return self
 
-    def _cleanup(self):
-        omni = getattr(self, "omni", None)
-        if omni is not None and hasattr(omni, "close"):
-            omni.close()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self.omni, "close"):
+            self.omni.close()
         self._cleanup_process()
         run_pre_test_cleanup()
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._cleanup()
 
 
 class OmniRunnerHandler:
