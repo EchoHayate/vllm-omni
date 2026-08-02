@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
 import pytest
 import torch
+from transformers import WhisperConfig
 
 from vllm_omni.model_executor.models.common.whisper_vq import WhisperVQEncoder
 
@@ -14,7 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 def _make_encoder() -> WhisperVQEncoder:
     encoder = WhisperVQEncoder.__new__(WhisperVQEncoder)
     torch.nn.Module.__init__(encoder)
-    encoder.config = SimpleNamespace(pooling_kernel_size=2)
+    encoder.config = WhisperConfig(pooling_kernel_size=2)
     encoder.pooling_layer = torch.nn.MaxPool1d(kernel_size=2)
     encoder.codebook = torch.nn.Embedding(8, 2)
     encoder.embed_positions2 = None
