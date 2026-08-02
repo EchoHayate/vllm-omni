@@ -4,8 +4,8 @@
 """VAE patch-parallel decode parity tests for diffusion models.
 
 Compares ``vae_patch_parallel_size=2`` against ``vae_patch_parallel_size=1`` on
-TP=2 with VAE tiling enabled. Covers one video model (Wan 2.1 T2V 1.3B) and one
-lightweight Qwen-Image checkpoint. CUDA/ROCm-only (>=2 devices).
+TP=2 with VAE tiling enabled. Covers one video model (Wan T2V) and one image
+model (Qwen-Image). CUDA/ROCm-only (>=2 devices).
 """
 
 from __future__ import annotations
