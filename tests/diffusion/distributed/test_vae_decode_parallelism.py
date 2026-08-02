@@ -31,9 +31,7 @@ from vllm_omni.platforms import current_omni_platform
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "A cat sitting on a table"
-WORKER_EXTENSION_CLASS = (
-    "tests.diffusion.distributed.test_vae_decode_parallelism.VaeParallelStateExtension"
-)
+WORKER_EXTENSION_CLASS = "tests.diffusion.distributed.test_vae_decode_parallelism.VaeParallelStateExtension"
 
 MODEL_CASES = [
     pytest.param(
@@ -70,9 +68,7 @@ class VaeParallelStateExtension:
         vae = self.model_runner.pipeline.vae
         actual_parallel_size = int(vae.distributed_executor.parallel_size)
         distributed_enabled = bool(vae.is_distributed_enabled())
-        return actual_parallel_size == expected_parallel_size and distributed_enabled == (
-            expected_parallel_size > 1
-        )
+        return actual_parallel_size == expected_parallel_size and distributed_enabled == (expected_parallel_size > 1)
 
 
 def _to_float_array(data: Any) -> np.ndarray:
@@ -154,8 +150,7 @@ def _run_generate(
             args=(vae_patch_parallel_size,),
         )
         assert vae_state == [[True]], (
-            f"Expected every worker to use VAE patch parallel size "
-            f"{vae_patch_parallel_size}, got {vae_state}"
+            f"Expected every worker to use VAE patch parallel size {vae_patch_parallel_size}, got {vae_state}"
         )
         request: dict[str, Any] = {"prompt": model_case.get("prompt", PROMPT)}
         if model_case["needs_image"]:
