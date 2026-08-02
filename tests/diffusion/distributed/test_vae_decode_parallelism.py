@@ -32,7 +32,7 @@ PROMPT = "A cat sitting on a table"
 MODEL_CASES = [
     pytest.param(
         {
-            "model_name": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            "model_name": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             "height": 512,
             "width": 512,
             "num_frames": 5,
@@ -41,20 +41,20 @@ MODEL_CASES = [
             "mean_threshold": 3e-2,
             "p99_threshold": 3e-2,
         },
-        id="wan21_t2v_1_3b",
+        id="wan22_t2v_a14b",
     ),
     pytest.param(
         {
-            "model_name": "riverclouds/qwen_image_random",
-            "height": 512,
-            "width": 512,
+            "model_name": "Qwen/Qwen-Image",
+            "height": 1152,
+            "width": 1152,
             "num_frames": 1,
             "needs_image": False,
             "is_moe": False,
             "mean_threshold": 5e-3,
             "p99_threshold": 1e-1,
         },
-        id="qwen_image_random",
+        id="qwen_image",
     ),
 ]
 
@@ -146,7 +146,7 @@ def _run_generate(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 2, "rocm": 2})
 @pytest.mark.parametrize("model_case", MODEL_CASES)
 def test_vae_patch_parallel_tp2(model_case: dict[str, Any], tmp_path: Path):
     if current_omni_platform.is_npu():
