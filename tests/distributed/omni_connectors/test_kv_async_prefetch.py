@@ -348,17 +348,13 @@ def test_start_prefetch_submits_for_owner(monkeypatch):
     receiver.shutdown_prefetch()
 
 
-def test_consume_then_apply_attaches_payload():
+def test_consume_and_distribute_attaches_prefetched_payload():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-apply")
     receiver.start_prefetch({"request_id": "rid-apply", "kv_sender_info": _SENDER_INFO})
-    data, _ = receiver.consume_prefetched_kv(_req("rid-apply"))
-    assert data is not None
 
     req = OmniDiffusionRequest(prompt="p", sampling_params=OmniDiffusionSamplingParams(), request_id="rid-apply")
-    # Mirror consume_and_distribute_kv_cache's LOCAL apply path (CPU: record_stream no-op).
-    receiver._record_stream_for_prefetched(data)
-    receiver.apply_kv_cache_to_request(req, data)
+    assert receiver.consume_and_distribute_kv_cache(req)
     assert req.past_key_values is not None
 
 

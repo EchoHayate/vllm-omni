@@ -15,7 +15,8 @@ python benchmarks/distributed/omni_connectors/benchmark_async_prefetch_h2d.py \
     --iterations 20
 ```
 
-`event_future_ready` is the event-based submission latency.
+`event_future_ready` includes executor submission, background-thread scheduling,
+and the event-based H2D enqueue until the prefetch future becomes ready.
 `blocking_future_ready` includes waiting for the same copy event and models the
 previous future-ready behavior.
 

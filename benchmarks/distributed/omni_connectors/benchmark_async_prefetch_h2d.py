@@ -48,6 +48,7 @@ def main() -> None:
         OmniKVCacheConfig(need_recv_cache=True),
         async_prefetch=True,
     )
+    assert manager._prefetch_executor is not None
 
     def fake_receive(
         request_id,
@@ -77,12 +78,14 @@ def main() -> None:
         torch.accelerator.synchronize()
         torch.accelerator.reset_peak_memory_stats()
         started = time.perf_counter()
-        result = manager._prefetch_payload(
+        future = manager._prefetch_executor.submit(
+            manager._prefetch_payload,
             f"bench-{iteration}",
             None,
             device,
         )
-        submitted = time.perf_counter()
+        result = future.result()
+        future_ready = time.perf_counter()
         event_incomplete += int(not result.ready_event.query())
         result.ready_event.synchronize()
         completed = time.perf_counter()
@@ -90,7 +93,7 @@ def main() -> None:
         manager._release_prefetch_result(result)
 
         if iteration >= args.warmup:
-            submit_ms.append((submitted - started) * 1000)
+            submit_ms.append((future_ready - started) * 1000)
             blocking_ready_ms.append((completed - started) * 1000)
             peak_memory_mib.append(peak_mib)
         del result
