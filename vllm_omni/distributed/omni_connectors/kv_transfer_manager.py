@@ -1350,7 +1350,7 @@ class OmniKVTransferManager:
                     current_stream = current_omni_platform.current_stream()
                     current_stream.wait_event(result.ready_event)
                     if result.data is not None:
-                        self._record_stream_for_prefetched(result.data)
+                        self._record_stream_for_prefetched(result.data, stream=current_stream)
                 except Exception as exc:
                     if not self._release_prefetch_result(result, wait=True):
                         self._pending_prefetch_releases.append(result)
@@ -1436,7 +1436,11 @@ class OmniKVTransferManager:
         self._drain_prefetch_releases(wait=True)
 
     @staticmethod
-    def _record_stream_for_prefetched(data: dict[str, Any]) -> None:
+    def _record_stream_for_prefetched(
+        data: dict[str, Any],
+        *,
+        stream: current_omni_platform.Stream | None = None,
+    ) -> None:
         """``record_stream(current_stream)`` on GPU tensors in *data*.
 
         Protects prefetch-thread tensors from allocator reuse on LEADER collective paths.
@@ -1445,12 +1449,13 @@ class OmniKVTransferManager:
             return
         if current_omni_platform.get_device_count() < 1:
             return
-        current_stream = current_omni_platform.current_stream()
+        if stream is None:
+            stream = current_omni_platform.current_stream()
         layer_blocks = data["layer_blocks"]
         for cache_list in (layer_blocks.get("key_cache", []), layer_blocks.get("value_cache", [])):
             for tensor in cache_list:
                 if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
-                    tensor.record_stream(current_stream)
+                    tensor.record_stream(stream)
 
     @torch.inference_mode()
     def receive_kv_cache_for_request(
@@ -1499,6 +1504,7 @@ class OmniKVTransferManager:
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
         deferred_memory: list[Any] = []
         copy_sources: list[torch.Tensor] = []
+        payload_consumed = False
 
         if non_blocking_copy and copy_stream is None:
             raise ValueError("copy_stream is required for non-blocking KV cache copies")
@@ -1550,6 +1556,7 @@ class OmniKVTransferManager:
                     if not result:
                         continue
 
+                    payload_consumed = True
                     raw_data, size = result
 
                     if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
@@ -1561,10 +1568,10 @@ class OmniKVTransferManager:
                             else:
                                 data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
                                 deferred_memory.append(raw_data)
-                        except Exception as e:
-                            logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
+                        except Exception as exc:
+                            logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", exc)
                             raw_data.release()
-                            return None, 0
+                            raise
                     elif isinstance(raw_data, (bytes, bytearray)):
                         data = KVCacheTransferData.from_bytes(raw_data)
                     elif isinstance(raw_data, torch.Tensor) and raw_data.dtype == torch.uint8 and raw_data.dim() == 1:
@@ -1637,6 +1644,11 @@ class OmniKVTransferManager:
 
                 if time.time() - start_time > timeout:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
+                    if payload_consumed:
+                        raise KVPrefetchConsumeError(
+                            f"KV receive timed out for {request_id} "
+                            "(payload already consumed for at least one rank)"
+                        )
                     return None, 0
 
                 time.sleep(poll_interval)
@@ -1644,8 +1656,12 @@ class OmniKVTransferManager:
 
         except KVPrefetchConsumeError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("Error receiving KV cache for %s", request_id)
+            if payload_consumed:
+                raise KVPrefetchConsumeError(
+                    f"Post-get processing failed for {request_id} (payload already consumed)"
+                ) from exc
             return None, 0
         finally:
             try:

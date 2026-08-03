@@ -358,6 +358,41 @@ def test_consume_and_distribute_attaches_prefetched_payload():
     assert req.past_key_values is not None
 
 
+def test_deserialization_failure_after_get_is_non_retryable(monkeypatch):
+    _, receiver, connector = _make_sender_receiver()
+    connector.get = lambda **_kwargs: (b"consumed-payload", 16)
+
+    def fail_deserialization(_payload):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.KVCacheTransferData.from_bytes",
+        fail_deserialization,
+    )
+
+    with pytest.raises(KVPrefetchConsumeError, match="payload already consumed"):
+        receiver.receive_kv_cache_for_request("rid-consumed")
+
+
+def test_partial_multi_key_timeout_after_get_is_non_retryable(monkeypatch):
+    _, receiver, connector = _make_sender_receiver()
+    receiver.config.recv_timeout = 0.0
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.build_rank_aware_recv_keys",
+        lambda *_args, **_kwargs: [("rank-0", 0), ("rank-1", 1)],
+    )
+
+    def get_one_rank(*, get_key, **_kwargs):
+        if get_key == "rank-0":
+            return {"layer_blocks": {}}, 1
+        return None
+
+    connector.get = get_one_rank
+
+    with pytest.raises(KVPrefetchConsumeError, match="payload already consumed"):
+        receiver.receive_kv_cache_for_request("rid-partial")
+
+
 def test_gpu_prefetch_records_event_without_synchronizing(monkeypatch):
     receiver = OmniKVTransferManager(
         OmniKVCacheConfig(need_recv_cache=True),
@@ -481,20 +516,21 @@ def test_consume_waits_event_and_records_destination_stream(monkeypatch):
         def wait_event(self, event):
             events.append(("wait_event", event))
 
+    compute_stream = _ComputeStream()
     monkeypatch.setattr(
         "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.current_stream",
-        lambda: _ComputeStream(),
+        lambda: compute_stream,
     )
     monkeypatch.setattr(
         receiver,
         "_record_stream_for_prefetched",
-        lambda payload: events.append(("record_stream", payload)),
+        lambda payload, stream=None: events.append(("record_stream", payload, stream)),
     )
 
     assert receiver.consume_prefetched_kv(_req("rid-gpu")) == (data, 7)
     assert events == [
         ("wait_event", ready_event),
-        ("record_stream", data),
+        ("record_stream", data, compute_stream),
     ]
 
 
