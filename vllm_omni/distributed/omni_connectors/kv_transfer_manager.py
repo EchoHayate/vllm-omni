@@ -1646,8 +1646,7 @@ class OmniKVTransferManager:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                     if payload_consumed:
                         raise KVPrefetchConsumeError(
-                            f"KV receive timed out for {request_id} "
-                            "(payload already consumed for at least one rank)"
+                            f"KV receive timed out for {request_id} (payload already consumed for at least one rank)"
                         )
                     return None, 0
 
