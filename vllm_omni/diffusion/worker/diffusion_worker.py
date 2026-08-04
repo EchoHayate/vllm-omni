@@ -91,6 +91,10 @@ class _DiffusionVllmModelConfig:
     def is_diffusion(self) -> bool:
         return False
 
+    @property
+    def head_dtype(self) -> torch.dtype:
+        return self.dtype
+
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
     quant_config = getattr(od_config, "quantization_config", None)
