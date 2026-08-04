@@ -534,12 +534,13 @@ def test_consume_waits_event_and_records_destination_stream(monkeypatch):
     ]
 
 
-def test_consumed_prefetch_releases_pool_buffer_after_event_completes():
+def test_consumed_prefetch_releases_pool_buffer_after_event_completes(monkeypatch):
     receiver = OmniKVTransferManager(
         OmniKVCacheConfig(need_recv_cache=True),
         async_prefetch=True,
     )
     events = []
+    waited_events = []
 
     class _Event:
         completed = False
@@ -547,7 +548,15 @@ def test_consumed_prefetch_releases_pool_buffer_after_event_completes():
         def query(self):
             return self.completed
 
+    class _ComputeStream:
+        def wait_event(self, event):
+            waited_events.append(event)
+
     ready_event = _Event()
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.kv_transfer_manager.current_omni_platform.current_stream",
+        _ComputeStream,
+    )
     pool_buffer = SimpleNamespace(release=lambda: events.append("release"))
     future = Future()
     future.set_result(
@@ -561,6 +570,7 @@ def test_consumed_prefetch_releases_pool_buffer_after_event_completes():
     receiver._prefetch_futures["rid-gpu"] = future
 
     receiver.consume_prefetched_kv(_req("rid-gpu"))
+    assert waited_events == [ready_event]
     assert events == []
     assert len(receiver._pending_prefetch_releases) == 1
 
