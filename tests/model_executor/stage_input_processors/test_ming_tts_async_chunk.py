@@ -155,7 +155,7 @@ def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
     outputs = llm2audio_vae([stage_output])
 
     assert len(outputs) == 1
-    additional_information = outputs[0].additional_information
+    additional_information = outputs[0]["additional_information"]
     torch.testing.assert_close(
         additional_information["ming_latent_patches"],
         patches[[0, 2]],
