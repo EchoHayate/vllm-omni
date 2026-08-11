@@ -16,6 +16,13 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import (
 )
 
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
+    QwenImagePipeline,
+)
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenImageTransformer2DModel,
+)
+from vllm_omni.quantization import build_quant_config
 
 
 class _DummyPipelineModel(nn.Module):
@@ -150,6 +157,10 @@ def test_prequant_bitsandbytes_initializes_packed_linear_state(
         "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
         return_value=0,
     )
+    mocker.patch(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
 
     quant_config = BitsAndBytesConfig.from_config(
         {
@@ -189,3 +200,86 @@ def test_prequant_bitsandbytes_initializes_packed_linear_state(
         "to_qkv",
         0,
     )
+
+
+def test_qwen_image_checkpoint_bnb_packs_unskipped_precision_sensitive_linears(
+    mocker,
+    monkeypatch,
+):
+    bnb = types.ModuleType("bitsandbytes")
+    bnb.__version__ = "0.48.1"
+    bnb_nn = types.ModuleType("bitsandbytes.nn")
+    bnb_nn.Int8Params = nn.Parameter
+    bnb.nn = bnb_nn
+    monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
+    monkeypatch.setitem(sys.modules, "bitsandbytes.nn", bnb_nn)
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+        return_value=1,
+    )
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    mocker.patch(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    mocker.patch(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        return_value=1,
+    )
+
+    quant_config = build_quant_config(
+        {
+            "quant_method": "bitsandbytes",
+            "_load_in_4bit": True,
+            "load_in_4bit": True,
+            "llm_int8_skip_modules": [
+                "transformer_blocks.0.img_mod.1",
+                "norm_out.linear",
+                "proj_out",
+            ],
+        }
+    )
+    od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            sequence_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        transformer = QwenImageTransformer2DModel(
+            od_config=od_config,
+            in_channels=4,
+            out_channels=4,
+            num_layers=2,
+            attention_head_dim=4,
+            num_attention_heads=2,
+            joint_attention_dim=6,
+            axes_dims_rope=(2, 2, 4),
+            quant_config=quant_config,
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    assert transformer.img_in.weight.use_bitsandbytes_4bit is True
+    assert transformer.img_in.weight.pack_factor == 2
+    assert transformer.img_in.weight.shape == (16, 1)
+    assert transformer.txt_in.weight.use_bitsandbytes_4bit is True
+    assert transformer.txt_in.weight.shape == (24, 1)
+    assert not hasattr(
+        transformer.transformer_blocks[0].img_mod[1].weight,
+        "use_bitsandbytes_4bit",
+    )
+    assert transformer.transformer_blocks[1].img_mod[1].weight.use_bitsandbytes_4bit is True
+    assert transformer.transformer_blocks[1].txt_mod[1].weight.use_bitsandbytes_4bit is True
+
+
+def test_qwen_image_checkpoint_bnb_normalizes_quant_state_parameter_names():
+    assert QwenImagePipeline.hf_to_vllm_mapper._map_name(
+        "transformer_blocks.1.attn.to_out.0.weight"
+    ) == "transformer_blocks.1.attn.to_out.weight"
