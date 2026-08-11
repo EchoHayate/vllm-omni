@@ -66,10 +66,10 @@ def safe_quant_config(
     """
     if quant_config is None:
         return None
-    from vllm.model_executor.layers.quantization.inc import INCConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import (
         BitsAndBytesConfig,
     )
+    from vllm.model_executor.layers.quantization.inc import INCConfig
 
     if isinstance(quant_config, (BitsAndBytesConfig, INCConfig)):
         return quant_config

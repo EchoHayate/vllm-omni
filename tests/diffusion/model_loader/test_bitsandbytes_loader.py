@@ -280,6 +280,7 @@ def test_qwen_image_checkpoint_bnb_packs_unskipped_precision_sensitive_linears(
 
 
 def test_qwen_image_checkpoint_bnb_normalizes_quant_state_parameter_names():
-    assert QwenImagePipeline.hf_to_vllm_mapper._map_name(
-        "transformer_blocks.1.attn.to_out.0.weight"
-    ) == "transformer_blocks.1.attn.to_out.weight"
+    assert (
+        QwenImagePipeline.hf_to_vllm_mapper._map_name("transformer_blocks.1.attn.to_out.0.weight")
+        == "transformer_blocks.1.attn.to_out.weight"
+    )
