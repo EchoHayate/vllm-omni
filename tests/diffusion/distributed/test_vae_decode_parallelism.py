@@ -24,7 +24,6 @@ from PIL import Image
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -133,13 +132,10 @@ def _run_generate(
     seed: int,
 ) -> np.ndarray:
     current_omni_platform.empty_cache()
-    parallel_config = DiffusionParallelConfig(
-        tensor_parallel_size=2,
-        vae_patch_parallel_size=vae_patch_parallel_size,
-    )
     with OmniRunner(
         model_case["model_name"],
-        parallel_config=parallel_config,
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=vae_patch_parallel_size,
         vae_use_tiling=True,
         enforce_eager=False,
         worker_extension_cls=WORKER_EXTENSION_CLASS,
