@@ -57,6 +57,23 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
     )
 
 
+def test_streaming_prefill_reset_preempts_running_request_with_timestamp() -> None:
+    sched = _make_scheduler()
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    sched.running = [session]
+    sched._preempt_request = MagicMock()
+
+    sched._reset_running_request_for_streaming_prefill(session)
+
+    assert session not in sched.running
+    sched._preempt_request.assert_called_once()
+    preempted_request, preempted_at = sched._preempt_request.call_args.args
+    assert preempted_request is session
+    assert isinstance(preempted_at, float)
+    assert preempted_at > 0
+
+
 def _run_resumable_segment_stop(
     session: Request,
     *,
