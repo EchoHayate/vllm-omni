@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -83,9 +84,16 @@ def _to_float_array(data: Any) -> np.ndarray:
 
 
 def _extract_output_array(output: Any) -> np.ndarray:
-    req_out = output.request_output
-    payload = req_out.images[0]
+    payload = output.images[0]
     return _to_float_array(payload)
+
+
+def test_extract_output_array_accepts_flat_omni_output():
+    payload = np.zeros((2, 2, 3), dtype=np.float32)
+
+    result = _extract_output_array(SimpleNamespace(images=[payload]))
+
+    np.testing.assert_array_equal(result, payload)
 
 
 def _diff_metrics(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
