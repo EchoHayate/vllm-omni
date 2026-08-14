@@ -75,8 +75,6 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    if getattr(model_config, "final_output", False):
-        return False
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
     if not isinstance(next_stage_func, str) or not next_stage_func:
         return False
@@ -1898,6 +1896,8 @@ class OmniConnectorModelRunnerMixin:
             "pooling_output": pooling_output,
             "request": request,
         }
+        if request_id is not None and self._custom_process_supports_kwarg("request_id"):
+            kwargs["request_id"] = request_id
         supports_is_finished = getattr(
             self,
             "_custom_process_supports_is_finished",
@@ -1926,6 +1926,17 @@ class OmniConnectorModelRunnerMixin:
         except Exception:
             logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
             return None
+
+    def _custom_process_supports_kwarg(self, name: str) -> bool:
+        if self._custom_process_func is None:
+            return False
+        try:
+            signature = inspect.signature(self._custom_process_func)
+        except (TypeError, ValueError):
+            return False
+        return name in signature.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        )
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""

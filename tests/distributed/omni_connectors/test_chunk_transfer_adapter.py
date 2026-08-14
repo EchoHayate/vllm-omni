@@ -200,6 +200,121 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
+def test_load_poll_explicit_replace_applies_to_non_resumable_first_chunk(
+    build_adapter,
+    mocker: MockerFixture,
+) -> None:
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = SimpleNamespace(
+        request_id="req-replace",
+        external_req_id="external-replace",
+        status=RequestStatus.WAITING,
+        resumable=False,
+        _all_token_ids=[0] * 21,
+        _output_token_ids=[],
+        prompt_token_ids=[0] * 21,
+        num_computed_tokens=0,
+        num_output_placeholders=0,
+        num_prompt_tokens=21,
+        additional_information=None,
+        update_block_hashes=mocker.Mock(),
+        is_finished=lambda: False,
+    )
+    payload: OmniPayload = {
+        "ids": {"output": [1, 2, 3]},
+        "embed": {"decode": torch.ones((3, 4))},
+        "meta": {
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 3,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+    adapter.waiting_for_chunk_waiting_requests.append(request)
+
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [0] * 21
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        [],
+        scheduler_requests={request.request_id: request},
+    )
+
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request.num_prompt_tokens == 3
+    assert request.num_computed_tokens == 0
+    request.update_block_hashes.assert_called_once_with()
+
+
+def test_running_request_replace_is_applied_on_scheduler_thread_and_reprefilled(
+    build_adapter,
+    mocker: MockerFixture,
+) -> None:
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = SimpleNamespace(
+        request_id="req-running-replace",
+        external_req_id="external-running-replace",
+        status=RequestStatus.WAITING_FOR_CHUNK,
+        resumable=False,
+        _all_token_ids=[0, 0, 42],
+        _output_token_ids=[42],
+        prompt_token_ids=[0, 0],
+        num_computed_tokens=2,
+        num_output_placeholders=0,
+        num_prompt_tokens=2,
+        additional_information=None,
+        update_block_hashes=mocker.Mock(),
+        is_finished=lambda: False,
+    )
+    payload: OmniPayload = {
+        "ids": {"output": [10, 11]},
+        "embed": {"decode": torch.ones((2, 4))},
+        "meta": {
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 2,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+    adapter.waiting_for_chunk_running_requests.append(request)
+
+    assert adapter._poll_single_request(request) is True
+
+    # The background receiver must not race the scheduler by rewriting a
+    # running request while schedule() may still be reading its old decode
+    # state.
+    assert request.num_computed_tokens == 2
+    assert request.prompt_token_ids == [0, 0]
+
+    waiting_queue = DummyWaitingQueue()
+    running_queue = []
+    reset_requests = []
+
+    def reset_running_request(req):
+        reset_requests.append(req)
+        req.status = RequestStatus.PREEMPTED
+        waiting_queue.prepend_requests([req])
+
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+        reset_running_request=reset_running_request,
+    )
+
+    assert reset_requests == [request]
+    assert request.prompt_token_ids == [0, 0]
+    assert request._all_token_ids == [0, 0]
+    assert request._output_token_ids == []
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 2
+    assert request.additional_information == payload
+    request.update_block_hashes.assert_called_once_with()
+    assert request not in adapter.waiting_for_chunk_running_requests
+    assert waiting_queue == [request]
+
+
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-tensor", RequestStatus.WAITING, external_req_id="external-tensor")
@@ -222,6 +337,64 @@ def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter)
     assert request.additional_information["meta"]["left_context_size"] == 1
     assert "finished" not in request.additional_information["meta"]
     assert "req-tensor" in adapter._finished_load_reqs
+
+
+def test_load_poll_generation_1d_codes_remain_in_additional_information(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req(
+        "req-code2wav",
+        RequestStatus.WAITING,
+        external_req_id="external-code2wav",
+    )
+    codes = torch.tensor([101, 102], dtype=torch.long)
+    payload: OmniPayload = {
+        "codes": {"audio": codes},
+        "meta": {
+            "request_id": "external-code2wav",
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [101, 102]
+    assert torch.equal(
+        request.additional_information["codes"]["audio"],
+        codes,
+    )
+
+
+def test_load_poll_generation_preserves_terminal_finished_metadata(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req(
+        "req-code2wav-terminal",
+        RequestStatus.WAITING,
+        external_req_id="external-code2wav-terminal",
+    )
+    request.additional_information = {
+        "meta": {
+            "request_id": "external-code2wav-terminal",
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    payload: OmniPayload = {
+        "codes": {"audio": torch.tensor([103], dtype=torch.long)},
+        "meta": {
+            "request_id": "external-code2wav-terminal",
+            "finished": torch.tensor(True, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.additional_information["meta"]["finished"].item() is True
+    assert "req-code2wav-terminal" in adapter.finished_requests
 
 
 def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):
@@ -278,6 +451,34 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_save_async_snapshots_request_tokens_for_background_processor(
+    build_adapter,
+):
+    adapter, _ = build_adapter(stage_id=0)
+    request = _req(
+        "req-snapshot",
+        RequestStatus.WAITING,
+        external_req_id="external-snapshot",
+    )
+    request.output_token_ids = [11]
+    seen_output_token_ids = []
+
+    def recording_processor(**kwargs):
+        seen_output_token_ids.append(list(kwargs["request"].output_token_ids))
+        return None
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    adapter.save_async(
+        multimodal_output={"hidden": torch.tensor([[1.0]])},
+        request=request,
+    )
+
+    request.output_token_ids.append(12)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert seen_output_token_ids == [[11]]
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -506,6 +707,28 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
 
     assert len(adapter._pending_save_reqs) == 1
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+
+
+def test_save_async_allows_processor_managed_output_dedup_after_reprefill(
+    build_adapter,
+):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-codec", RequestStatus.WAITING, external_req_id="ext-codec")
+    request.num_computed_tokens = 2
+    adapter.requests_num_chunks_sent["ext-codec"] = 3
+
+    def processor_with_output_dedup(**kwargs):
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+        )
+
+    processor_with_output_dedup.manages_output_dedup = True
+    adapter.custom_process_next_stage_input_func = processor_with_output_dedup
+
+    adapter.save_async(multimodal_output=None, request=request)
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-codec"] == 2
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
@@ -863,6 +1086,7 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
+    adapter._pending_streaming_prefills[req_id] = {"meta": {"replace_streaming_prompt": True}}
     adapter._pending_load_reqs.append(SimpleNamespace(request_id=req_id))
     adapter._finished_load_reqs.add(req_id)
 
@@ -884,6 +1108,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
+    assert req_id not in adapter._pending_streaming_prefills
     assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
 

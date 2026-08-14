@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -180,6 +181,45 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
             "max_position_embeddings": 65536,
         },
     }
+
+
+def test_missing_hf_config_is_synthesized_for_registered_code2wav(
+    tmp_path,
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+
+    def fake_create_model_config(self):
+        captured["hf_config_path"] = self.hf_config_path
+        config_path = tmp_path / "captured_config.json"
+        config_path.write_text((Path(self.hf_config_path) / "config.json").read_text())
+        captured["config_path"] = config_path
+        return baseline_config
+
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    decoder_dir = tmp_path / "decoder"
+    decoder_dir.mkdir()
+    OmniEngineArgs(
+        model=str(decoder_dir),
+        model_arch="LlamaOmni2Code2Wav",
+        model_stage="code2wav",
+        worker_type="generation",
+        worker_cls="test.worker",
+    ).create_model_config()
+
+    config = json.loads(captured["config_path"].read_text())
+    assert config == {
+        "architectures": ["LlamaOmni2Code2Wav"],
+        "model_type": "omni2_speech2s_qwen2",
+    }
+    assert captured["hf_config_path"] is not None
 
 
 def test_patch_missing_local_hf_config(tmp_path):

@@ -4,6 +4,7 @@
 import importlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from typing import Any
 
 import torch
@@ -116,6 +117,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
 
+    @staticmethod
+    def _snapshot_request_for_save(request: Request) -> Request:
+        snapshot = copy(request)
+        for attr in ("prompt_token_ids", "output_token_ids", "all_token_ids"):
+            value = getattr(request, attr, None)
+            if value is not None:
+                setattr(snapshot, attr, list(value))
+        return snapshot
+
     @classmethod
     def create_connector(cls, model_config: Any):
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -182,9 +192,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = request.is_finished() and not request.resumable
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        processor_manages_output_dedup = bool(
+            getattr(
+                self.custom_process_next_stage_input_func,
+                "manages_output_dedup",
+                False,
+            )
+        )
 
         # If the request is preempted, skip the already saved chunks.
-        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
+        if (
+            confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0)
+            and not processor_manages_output_dedup
+        ):
             logger.warning(
                 f"Enqueue save_async for request {request.external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
@@ -196,7 +216,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
-            "request": request,
+            "request": self._snapshot_request_for_save(request),
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
@@ -235,9 +255,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
-                request.additional_information = payload_data
                 replace_prompt = meta.get("replace_streaming_prompt") is True
-                if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
+                if replace_prompt:
+                    # The recv loop runs on a background thread. Rewriting a
+                    # request here can race the scheduler. Apply all explicit
+                    # prompt replacements at the start of the next scheduler
+                    # tick; running requests can then reset KV/persistent-batch
+                    # state before the replacement is scheduled.
+                    self._pending_streaming_prefills[req_id] = payload_data
+                else:
+                    request.additional_information = payload_data
+                if not replace_prompt and getattr(request, "resumable", False) and chunk_id > 0:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
@@ -272,7 +300,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
                     if key == "codes":
-                        if use_tensor_codes and isinstance(value, dict):
+                        if isinstance(value, dict):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                             merged_sub.update(value)
@@ -282,7 +310,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (self.model_mode == "generation" and payload_finished)
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -435,6 +467,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
+        self._pending_streaming_prefills.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -461,7 +494,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
-        self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -497,6 +529,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         running_queue: list[Request],
         *,
         scheduler_requests: dict[str, Request] | None = None,
+        reset_running_request: Callable[[Request], None] | None = None,
     ) -> None:
         """
         Process pending chunks for waiting and running queues.
@@ -538,6 +571,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 RequestStatus.RUNNING,
                 self._finished_load_reqs,
             )
+            self._apply_pending_streaming_prefills(
+                waiting_queue,
+                running_queue,
+                scheduler_requests=scheduler_requests,
+                reset_running_request=reset_running_request,
+            )
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
                 request.status = RequestStatus.PREEMPTED
@@ -552,8 +591,56 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
+        self._apply_pending_streaming_prefills(
+            waiting_queue,
+            running_queue,
+            scheduler_requests=scheduler_requests,
+            reset_running_request=reset_running_request,
+        )
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _apply_pending_streaming_prefills(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        *,
+        scheduler_requests: dict[str, Request] | None,
+        reset_running_request: Callable[[Request], None] | None,
+    ) -> None:
+        if not self._pending_streaming_prefills:
+            return
+
+        for request_id, payload_data in list(self._pending_streaming_prefills.items()):
+            request = scheduler_requests.get(request_id) if scheduler_requests is not None else None
+            if request is None:
+                request = next((req for req in running_queue if req.request_id == request_id), None)
+            if request is None:
+                continue
+
+            parked_running = any(parked.request_id == request_id for parked in self.waiting_for_chunk_running_requests)
+            if request in running_queue or parked_running:
+                if reset_running_request is None:
+                    continue
+                self.waiting_for_chunk_running_requests = deque(
+                    parked for parked in self.waiting_for_chunk_running_requests if parked.request_id != request_id
+                )
+                request.status = RequestStatus.RUNNING
+                reset_running_request(request)
+                self.requests_origin_status.pop(request_id, None)
+
+            request.additional_information = payload_data
+            construct_next_stage_streaming_input_prompt(payload_data, request)
+            self._finished_load_reqs.discard(request_id)
+            self.requests_with_ready_chunks.add(request_id)
+            self._pending_streaming_prefills.pop(request_id, None)
+
+    def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
+        for request_id in list(self._active_streams):
+            if request_ids is not None and request_id not in request_ids:
+                continue
+            if request_id in self.finished_requests:
+                self._active_streams.pop(request_id, None)
 
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:

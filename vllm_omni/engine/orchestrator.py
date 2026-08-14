@@ -125,6 +125,14 @@ def build_engine_core_request_from_tokens(
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
+        sampling_params_override = prompt.get("sampling_params_override")
+        if sampling_params_override is not None:
+            if not isinstance(sampling_params_override, dict):
+                raise TypeError("sampling_params_override must be a dictionary")
+            for name, value in sampling_params_override.items():
+                if not hasattr(sampling_params, name):
+                    raise ValueError(f"Unknown sampling parameter override: {name}")
+                setattr(sampling_params, name, value)
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
     else:

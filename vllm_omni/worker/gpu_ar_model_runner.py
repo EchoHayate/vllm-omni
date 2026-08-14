@@ -59,7 +59,6 @@ from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
 
-
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     if tensor.device.type == "cpu":
@@ -330,6 +329,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "Omni2Speech2SQwen2ForCausalLM",
             "CovoAudioForConditionalGeneration",
             "MiMoAudioModel",
             "Qwen3TTSTalkerForConditionalGeneration",
@@ -998,6 +998,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             scheduled_seq_len=scheduled_seq_len,
         )
         payload.update(mm_payload)
+        for category, qualifier in set(
+            getattr(
+                getattr(self, "model", None),
+                "cumulative_postprocess_output_buffer_keys",
+                (),
+            )
+            or ()
+        ):
+            buffered = self.model_intermediate_buffer.get(rid, {})
+            nested = buffered.get(category) if isinstance(buffered, dict) else None
+            if isinstance(nested, dict) and qualifier in nested:
+                payload.setdefault(category, {})[qualifier] = nested[qualifier]
         return payload
 
     @torch.inference_mode()

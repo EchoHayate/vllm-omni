@@ -21,6 +21,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponseStreamChoice,
@@ -489,7 +490,10 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     request = _make_request(modalities=["text", "audio"])
 
     empty_audio = _make_audio_omni_output()
-    empty_audio.outputs[0].multimodal_output = {"audio": []}
+    empty_audio.outputs[0].multimodal_output = {
+        "audio": [torch.empty(0)],
+        "sr": torch.tensor(24000),
+    }
 
     def create_audio_choice(omni_res, role, request, stream=False):
         return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)
@@ -515,6 +519,13 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
 
     assert not any("Error in chat completion stream generator" in line for line in raw_lines)
     chunks = _parse_sse_chunks(raw_lines)
+    audio_contents = [
+        choice["delta"].get("content")
+        for chunk in chunks
+        if chunk.get("modality") == "audio"
+        for choice in chunk.get("choices", [])
+    ]
+    assert not any(audio_contents)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
     assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
     assert finish_reasons[-1] == "stop"

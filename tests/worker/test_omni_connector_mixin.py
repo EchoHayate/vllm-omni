@@ -21,6 +21,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.worker.gpu_ar_model_runner import _should_init_runner_omni_connectors
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
@@ -84,6 +85,45 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing."""
 
     pass
+
+
+def test_async_chunk_uses_scheduler_owned_connector_only() -> None:
+    model_config = SimpleNamespace(
+        async_chunk=True,
+        model_arch="Omni2Speech2SQwen2ForCausalLM",
+        architectures=["Omni2Speech2SQwen2ForCausalLM"],
+        stage_connector_config={
+            "name": "SharedMemoryConnector",
+            "extra": {"role": "receiver"},
+        },
+    )
+
+    assert _should_init_runner_omni_connectors(model_config) is False
+
+
+def test_sync_full_payload_keeps_runner_owned_connector() -> None:
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        model_arch="Omni2Speech2SQwen2ForCausalLM",
+        architectures=["Omni2Speech2SQwen2ForCausalLM"],
+        stage_connector_config={
+            "name": "SharedMemoryConnector",
+            "extra": {"role": "receiver"},
+        },
+    )
+
+    assert _should_init_runner_omni_connectors(model_config) is True
+
+
+def test_llama_omni2_sync_thinker_initializes_output_connector() -> None:
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        model_arch="Omni2Speech2SQwen2ForCausalLM",
+        architectures=["Omni2Speech2SQwen2ForCausalLM"],
+        stage_connector_config=None,
+    )
+
+    assert _should_init_runner_omni_connectors(model_config) is True
 
 
 class _FakeTPGroup:
@@ -398,6 +438,43 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
 
 class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
     """Test B4: send_full_payload_outputs with full_payload_mode custom process func."""
+
+    def test_full_payload_send_passes_explicit_request_id_to_opted_in_hook(self):
+        seen = {}
+
+        def full_payload_func(
+            transfer_manager,
+            pooling_output,
+            request,
+            request_id=None,
+        ):
+            seen["request"] = request
+            seen["request_id"] = request_id
+            return {"processed": True}
+
+        host = MixinHost()
+        host.init_omni_connectors(
+            model_config=_make_model_config(),
+        )
+        host._omni_connector = MockConnector(stage_id=0)
+        host._stage_id = 0
+        host._custom_process_func = full_payload_func
+
+        sent = host.send_full_payload_outputs(
+            scheduler_output=None,
+            outputs={"req-1": ({"raw": 100}, None)},
+        )
+
+        self.assertEqual(sent, ["req-1"])
+        self.assertEqual(
+            seen,
+            {
+                "request": None,
+                "request_id": "req-1",
+            },
+        )
+
+        host.shutdown_omni_connectors()
 
     def test_full_payload_send_passes_is_finished_and_connector(self):
         seen = {}

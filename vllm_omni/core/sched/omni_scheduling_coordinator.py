@@ -40,6 +40,10 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         # stages of qwen2_5_omni are enabled.
         ("Qwen2_5OmniForConditionalGeneration", "talker"),
         ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
+        # LLaMA-Omni 2: Thinker -> Talker -> Code2Wav uses full-payload
+        # connector transfers when async_chunk is disabled.
+        ("Omni2Speech2SQwen2ForCausalLM", "talker"),
+        ("LlamaOmni2Code2Wav", "code2wav"),
         # covo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
         ("CovoAudioForConditionalGeneration", "code2wav"),
         # mimo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).

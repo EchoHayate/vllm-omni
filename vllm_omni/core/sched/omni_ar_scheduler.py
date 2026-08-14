@@ -227,7 +227,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
-        self._process_pending_omni_inputs(model_mode="ar")
+        self._consume_pending_connector_output(model_mode="ar")
+        self._process_pending_input_timeouts()
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting,
+                self.running,
+                scheduler_requests=self.requests,
+                reset_running_request=self._reset_running_request_for_streaming_prefill,
+            )
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -255,6 +263,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+    def _reset_running_request_for_streaming_prefill(self, request: Request) -> None:
+        if request in self.running:
+            self.running.remove(request)
+        self._preempt_request(request, time())
 
     def update_from_output(
         self,
