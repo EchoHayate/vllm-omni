@@ -72,7 +72,26 @@ class _LoadableModule(nn.Module):
         return self
 
 
-class _LoadableFlow(_LoadableModule):
+class _LoadableIncrementalFlow(_LoadableModule):
+    def __init__(self):
+        super().__init__()
+        self.decoder = SimpleNamespace(fp16=True)
+
+    def setup_cache(self, token, mel, spk, n_timesteps=10):
+        del token, mel, spk, n_timesteps
+
+    def inference_chunk(
+        self,
+        token,
+        spk,
+        cache,
+        last_chunk=False,
+        n_timesteps=10,
+    ):
+        del token, spk, cache, last_chunk, n_timesteps
+
+
+class _LoadableLegacyFlow(_LoadableModule):
     def __init__(self):
         super().__init__()
         self.decoder = SimpleNamespace(fp16=True)
@@ -91,19 +110,84 @@ def test_validate_decoder_dir_names_missing_artifact(tmp_path):
         validate_cosy2_decoder_dir(tmp_path)
 
 
-def test_decoder_loader_uses_flashcosyvoice_without_parsing_full_yaml(
+def test_decoder_loader_constructs_incremental_flow_from_yaml(
+    tmp_path,
+    monkeypatch,
+):
+    for name in ("flow.yaml", "flow.pt", "hift.pt"):
+        (tmp_path / name).write_bytes(b"fixture")
+
+    fake_flow = _LoadableIncrementalFlow()
+    fake_hift = _LoadableHift()
+    hyperpyyaml = ModuleType("hyperpyyaml")
+    hyperpyyaml.load_hyperpyyaml = lambda handle: {"flow": fake_flow}
+    flashcosyvoice = ModuleType("flashcosyvoice")
+    modules = ModuleType("flashcosyvoice.modules")
+    hifigan_module = ModuleType("flashcosyvoice.modules.hifigan")
+    hifigan_module.HiFTGenerator = lambda: fake_hift
+    monkeypatch.setitem(sys.modules, "hyperpyyaml", hyperpyyaml)
+    monkeypatch.setitem(sys.modules, "flashcosyvoice", flashcosyvoice)
+    monkeypatch.setitem(sys.modules, "flashcosyvoice.modules", modules)
+    monkeypatch.setitem(
+        sys.modules,
+        "flashcosyvoice.modules.hifigan",
+        hifigan_module,
+    )
+
+    def fake_load(path, **kwargs):
+        assert kwargs == {"map_location": "cpu", "weights_only": True}
+        if Path(path).name == "flow.pt":
+            return {"flow.weight": torch.ones(1)}
+        return {"generator.hift.weight": torch.ones(1)}
+
+    monkeypatch.setattr(torch, "load", fake_load)
+
+    flow, hift = _load_cosy2_modules(tmp_path, torch.device("cpu"))
+
+    assert flow is fake_flow
+    assert callable(flow.setup_cache)
+    assert callable(flow.inference_chunk)
+    assert "inference" not in flow.__dict__
+    assert hift is fake_hift
+    assert flow.loaded_state == {"flow.weight": torch.ones(1)}
+    assert hift.loaded_state == {"hift.weight": torch.ones(1)}
+    assert flow.loaded_strict is True
+    assert hift.loaded_strict is True
+    assert flow.decoder.fp16 is False
+    assert flow.target_device == torch.device("cpu")
+    assert hift.target_device == torch.device("cpu")
+    assert flow.eval_called
+    assert hift.eval_called
+    speech, source = hift.inference(
+        speech_feat=torch.ones(1, 80, 2),
+        cache_source=torch.ones(1, 1, 2),
+    )
+    assert torch.equal(speech, torch.full((1, 80, 2), 2.0))
+    assert torch.equal(source, torch.full((1, 1, 2), 3.0))
+
+
+def test_decoder_loader_uses_strict_flash_flow_for_legacy_cosyvoice_yaml(
     tmp_path,
     monkeypatch,
 ):
     for name in ("cosyvoice.yaml", "flow.pt", "hift.pt"):
         (tmp_path / name).write_bytes(b"fixture")
 
+    fake_flow = _LoadableLegacyFlow()
+    fake_hift = _LoadableHift()
+    hyperpyyaml = ModuleType("hyperpyyaml")
+
+    def reject_full_config(_handle):
+        raise AssertionError("legacy cosyvoice.yaml must not parse unrelated LLM config")
+
+    hyperpyyaml.load_hyperpyyaml = reject_full_config
     flashcosyvoice = ModuleType("flashcosyvoice")
     modules = ModuleType("flashcosyvoice.modules")
     flow_module = ModuleType("flashcosyvoice.modules.flow")
     hifigan_module = ModuleType("flashcosyvoice.modules.hifigan")
-    flow_module.CausalMaskedDiffWithXvec = _LoadableFlow
-    hifigan_module.HiFTGenerator = _LoadableHift
+    flow_module.CausalMaskedDiffWithXvec = lambda: fake_flow
+    hifigan_module.HiFTGenerator = lambda: fake_hift
+    monkeypatch.setitem(sys.modules, "hyperpyyaml", hyperpyyaml)
     monkeypatch.setitem(sys.modules, "flashcosyvoice", flashcosyvoice)
     monkeypatch.setitem(sys.modules, "flashcosyvoice.modules", modules)
     monkeypatch.setitem(sys.modules, "flashcosyvoice.modules.flow", flow_module)
@@ -123,21 +207,11 @@ def test_decoder_loader_uses_flashcosyvoice_without_parsing_full_yaml(
 
     flow, hift = _load_cosy2_modules(tmp_path, torch.device("cpu"))
 
+    assert flow is fake_flow
+    assert "inference" not in flow.__dict__
+    assert hift is fake_hift
     assert flow.loaded_state == {"flow.weight": torch.ones(1)}
-    assert hift.loaded_state == {"hift.weight": torch.ones(1)}
     assert flow.loaded_strict is True
-    assert hift.loaded_strict is True
-    assert flow.decoder.fp16 is False
-    assert flow.target_device == torch.device("cpu")
-    assert hift.target_device == torch.device("cpu")
-    assert flow.eval_called
-    assert hift.eval_called
-    speech, source = hift.inference(
-        speech_feat=torch.ones(1, 80, 2),
-        cache_source=torch.ones(1, 1, 2),
-    )
-    assert torch.equal(speech, torch.full((1, 80, 2), 2.0))
-    assert torch.equal(source, torch.full((1, 1, 2), 3.0))
 
 
 def test_default_english_speaker_embedding_is_packaged_and_nonzero():

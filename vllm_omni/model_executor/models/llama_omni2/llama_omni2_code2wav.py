@@ -21,7 +21,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 SAMPLE_RATE = 24000
-_REQUIRED_ARTIFACTS = ("cosyvoice.yaml", "flow.pt", "hift.pt")
+_DECODER_YAML_CANDIDATES = ("cosyvoice.yaml", "flow.yaml")
+_REQUIRED_ARTIFACTS = ("flow.pt", "hift.pt")
 _DEFAULT_SPEAKER_EMBEDDING = Path(__file__).with_name("assets") / "default_english_speaker_embedding.npy"
 
 
@@ -43,8 +44,24 @@ def load_default_speaker_embedding() -> torch.Tensor:
     return _cached_default_speaker_embedding().clone()
 
 
+def _resolve_decoder_yaml(
+    root: Path,
+    yaml_name: str | None = None,
+) -> Path:
+    candidates = (yaml_name,) if yaml_name else _DECODER_YAML_CANDIDATES
+    for candidate in candidates:
+        if candidate and (root / candidate).is_file():
+            return root / candidate
+    expected = ", ".join(name for name in candidates if name)
+    raise FileNotFoundError(
+        f"LLaMA-Omni 2 CosyVoice2 decoder is missing a supported YAML "
+        f"under {root}: {expected}"
+    )
+
+
 def validate_cosy2_decoder_dir(model_dir: str | os.PathLike[str]) -> Path:
     root = Path(model_dir)
+    _resolve_decoder_yaml(root)
     for artifact in _REQUIRED_ARTIFACTS:
         path = root / artifact
         if not path.is_file():
@@ -65,14 +82,23 @@ def _resolve_decoder_dir(model: str) -> Path:
 def _load_cosy2_modules(
     model_dir: Path,
     device: torch.device,
+    yaml_name: str | None = None,
 ) -> tuple[nn.Module, nn.Module]:
     try:
-        from flashcosyvoice.modules.flow import CausalMaskedDiffWithXvec
         from flashcosyvoice.modules.hifigan import HiFTGenerator
+        from hyperpyyaml import load_hyperpyyaml
     except ImportError as exc:
         raise ImportError("LLaMA-Omni 2 Code2Wav requires step-audio2's flashcosyvoice runtime") from exc
 
-    flow = CausalMaskedDiffWithXvec()
+    yaml_path = _resolve_decoder_yaml(model_dir, yaml_name)
+    if yaml_path.name == "flow.yaml":
+        with yaml_path.open(encoding="utf-8") as handle:
+            config = load_hyperpyyaml(handle)
+        flow = config["flow"]
+    else:
+        from flashcosyvoice.modules.flow import CausalMaskedDiffWithXvec
+
+        flow = CausalMaskedDiffWithXvec()
     flow.load_state_dict(
         torch.load(
             model_dir / "flow.pt",
@@ -84,31 +110,6 @@ def _load_cosy2_modules(
     flow.to(device).eval()
     if hasattr(flow, "decoder") and hasattr(flow.decoder, "fp16"):
         flow.decoder.fp16 = False
-
-    def inference(
-        self: nn.Module,
-        *,
-        token: torch.Tensor,
-        token_len: torch.Tensor,
-        prompt_token: torch.Tensor,
-        prompt_token_len: torch.Tensor,
-        prompt_feat: torch.Tensor,
-        prompt_feat_len: torch.Tensor,
-        embedding: torch.Tensor,
-        finalize: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del prompt_token, prompt_token_len
-        return self.forward(
-            token=token,
-            token_len=token_len,
-            prompt_feat=prompt_feat,
-            prompt_feat_len=prompt_feat_len,
-            embedding=embedding,
-            streaming=not finalize,
-            finalize=finalize,
-        )
-
-    flow.inference = MethodType(inference, flow)
 
     hift = HiFTGenerator()
     hift_state = {
