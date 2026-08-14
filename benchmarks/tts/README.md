@@ -223,7 +223,11 @@ python benchmarks/tts/summarize_llama_omni2_runs.py \
 The command exits nonzero if c1 median TTFP or RTF regresses by more than 5%,
 or if neither c4 nor c8 improves median RTF or audio throughput by at least
 10%. The report includes median, sample standard deviation, minimum, maximum,
-and relative change for all three metrics.
+and relative change for all three metrics. Before computing those metrics, the
+summarizer rejects any run that does not report all requested prompts as
+completed, reports one or more failed requests, or has non-positive audio
+duration, RTF, TTFP, or throughput. This prevents an SSE or engine failure from
+being mistaken for a valid performance result.
 
 ### 4. Plot a sweep
 

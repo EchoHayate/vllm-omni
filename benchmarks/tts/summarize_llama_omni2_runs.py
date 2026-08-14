@@ -16,6 +16,39 @@ _METRICS = (
 )
 
 
+def _positive_finite(payload: dict[str, Any], path: Path, metric: str) -> float:
+    value = payload.get(metric)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{path} has no positive {metric}")
+    return float(value)
+
+
+def _validate_run_payload(payload: dict[str, Any], path: Path) -> None:
+    num_prompts = payload.get("num_prompts")
+    completed = payload.get("completed")
+    failed = payload.get("failed")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (num_prompts, completed, failed)
+    ):
+        raise ValueError(
+            f"{path} must report integer num_prompts, completed, and failed"
+        )
+    if failed != 0:
+        raise ValueError(f"{path} reported failed={failed}")
+    if num_prompts <= 0 or completed != num_prompts:
+        raise ValueError(
+            f"{path} completed={completed}, expected num_prompts={num_prompts}"
+        )
+    _positive_finite(payload, path, "total_audio_duration_s")
+    _positive_finite(payload, path, "median_audio_duration_s")
+
+
 def _load_metric_values(paths: list[Path], metric: str) -> list[float]:
     if len(paths) < 3:
         raise ValueError(
@@ -24,10 +57,8 @@ def _load_metric_values(paths: list[Path], metric: str) -> list[float]:
     values: list[float] = []
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        value = payload.get(metric)
-        if not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ValueError(f"{path} has no finite {metric}")
-        values.append(float(value))
+        _validate_run_payload(payload, path)
+        values.append(_positive_finite(payload, path, metric))
     return values
 
 

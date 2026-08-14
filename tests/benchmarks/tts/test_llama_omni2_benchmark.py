@@ -145,12 +145,22 @@ def _write_result(
     ttfp_ms: float,
     rtf: float,
     throughput: float,
+    num_prompts: int = 8,
+    completed: int = 8,
+    failed: int = 0,
+    total_audio_duration_s: float = 12.0,
+    median_audio_duration_s: float = 1.5,
 ) -> Path:
     path.write_text(
         json.dumps(
             {
+                "num_prompts": num_prompts,
+                "completed": completed,
+                "failed": failed,
                 "median_audio_ttfp_ms": ttfp_ms,
                 "median_audio_rtf": rtf,
+                "median_audio_duration_s": median_audio_duration_s,
+                "total_audio_duration_s": total_audio_duration_s,
                 "audio_throughput": throughput,
             }
         ),
@@ -218,6 +228,54 @@ def test_three_run_summary_reports_dispersion_and_relative_change(
     assert summary["metrics"]["audio_throughput"][
         "relative_change_percent"
     ] == pytest.approx(20.0)
+
+
+def test_three_run_summary_rejects_failed_requests(tmp_path: Path) -> None:
+    import summarize_llama_omni2_runs as summarize
+
+    paths = [
+        _write_result(
+            tmp_path / f"run-{index}.json",
+            ttfp_ms=100.0,
+            rtf=0.5,
+            throughput=1.0,
+            completed=7 if index == 2 else 8,
+            failed=1 if index == 2 else 0,
+        )
+        for index in range(1, 4)
+    ]
+
+    with pytest.raises(ValueError, match=r"run-2\.json.*failed=1"):
+        summarize.summarize_comparison(
+            before_paths=paths,
+            after_paths=paths,
+            label="c4",
+        )
+
+
+def test_three_run_summary_rejects_zero_audio_output(tmp_path: Path) -> None:
+    import summarize_llama_omni2_runs as summarize
+
+    paths = [
+        _write_result(
+            tmp_path / f"run-{index}.json",
+            ttfp_ms=100.0,
+            rtf=0.5,
+            throughput=1.0,
+            total_audio_duration_s=0.0 if index == 3 else 12.0,
+        )
+        for index in range(1, 4)
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"run-3\.json.*positive total_audio_duration_s",
+    ):
+        summarize.summarize_comparison(
+            before_paths=paths,
+            after_paths=paths,
+            label="c8",
+        )
 
 
 def test_gate_rejects_c1_latency_regression_over_five_percent() -> None:
