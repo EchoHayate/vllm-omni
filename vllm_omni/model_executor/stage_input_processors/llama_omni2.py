@@ -25,6 +25,7 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
         "codes.audio",
     }
 )
+TALKER_EOS_TOKEN_ID = 151643
 TALKER_SEPARATOR_TOKEN_ID = 151665
 TALKER_CODEC_TOKEN_OFFSET = 151666
 TALKER_CODEC_VOCAB_SIZE = 6561
@@ -44,6 +45,16 @@ def _decode_codec_token_ids(token_ids: list[int]) -> list[int]:
             f"LLaMA-Omni 2 codec token IDs must be in [{TALKER_CODEC_TOKEN_OFFSET}, {codec_end}), got {invalid[:8]}"
         )
     return [token_id - TALKER_CODEC_TOKEN_OFFSET for token_id in token_ids]
+
+
+def _decode_terminal_codec_token_ids(
+    token_ids: list[int],
+    *,
+    finished: bool,
+) -> list[int]:
+    if finished and token_ids[-1:] == [TALKER_EOS_TOKEN_ID]:
+        token_ids = token_ids[:-1]
+    return _decode_codec_token_ids(token_ids)
 
 
 @dataclass
@@ -388,15 +399,23 @@ def talker2code2wav_async_chunk(
 
     state = _state_store(transfer_manager).get(_request_id(request))
     was_finished = state.codec_finished
-    delta = state.consume_codec_tokens(codes.tolist(), finished=is_finished)
-    if not delta and not (is_finished and not was_finished):
+    current = codes.tolist()
+    delta = _new_items("codec token stream", state.codec_tokens, current)
+    decoded_delta = _decode_terminal_codec_token_ids(
+        delta,
+        finished=is_finished,
+    )
+    if not decoded_delta and not (is_finished and not was_finished):
         return None
+    state.codec_tokens = current
+    if is_finished:
+        state.codec_finished = True
     chunk_seq = state.codec_chunk_seq
     state.codec_chunk_seq += 1
     return OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(
-                _decode_codec_token_ids(delta),
+                decoded_delta,
                 dtype=torch.long,
             )
         ),
@@ -423,7 +442,10 @@ def talker2code2wav_full_payload(
     codes = _tensor_from_payload(pooling_output, "codes", "audio")
     if codes is None or codes.numel() == 0:
         return None
-    decoded_codes = _decode_codec_token_ids(codes.to(torch.long).reshape(-1).tolist())
+    decoded_codes = _decode_terminal_codec_token_ids(
+        codes.to(torch.long).reshape(-1).tolist(),
+        finished=True,
+    )
     return {
         "codes": {"audio": torch.tensor(decoded_codes, dtype=torch.long)},
         "meta": {

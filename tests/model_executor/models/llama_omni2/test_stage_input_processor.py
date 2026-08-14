@@ -493,6 +493,50 @@ def test_talker_async_emits_first_terminal_even_without_new_codec_delta():
     )
 
 
+def test_talker_async_filters_terminal_eos_without_skipping_chunk_sequence():
+    manager = _TransferManager()
+    request = _Request()
+    first = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    terminal = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766, 151643])}},
+        request,
+        is_finished=True,
+    )
+
+    assert first.codes.audio.tolist() == [100]
+    assert first.meta.chunk_seq == 0
+    assert terminal.codes.audio.numel() == 0
+    assert terminal.meta.finished.item() is True
+    assert terminal.meta.chunk_seq == 1
+
+
+def test_talker_async_invalid_codec_token_does_not_mutate_stream_state():
+    manager = _TransferManager()
+    request = _Request()
+
+    with pytest.raises(ValueError, match="codec token IDs"):
+        talker2code2wav_async_chunk(
+            manager,
+            {"codes": {"audio": torch.tensor([151665])}},
+            request,
+        )
+
+    first = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    assert first.codes.audio.tolist() == [100]
+    assert first.meta.chunk_seq == 0
+
+
 def test_talker_async_rejects_out_of_order_codec_chunk():
     manager = _TransferManager()
     request = _Request()
@@ -520,6 +564,18 @@ def test_talker_full_payload_propagates_terminal_codec_ids():
     assert payload["codes"]["audio"].tolist() == [100, 101, 102]
     assert payload["meta"]["finished"].item() is True
     assert payload["meta"]["request_id"] == "request-a"
+    assert payload["meta"]["chunk_seq"] == 0
+
+
+def test_talker_full_payload_filters_terminal_eos():
+    payload = talker2code2wav_full_payload(
+        _TransferManager(),
+        {"codes.audio": torch.tensor([151766, 151643])},
+        _Request(),
+    )
+
+    assert payload["codes"]["audio"].tolist() == [100]
+    assert payload["meta"]["finished"].item() is True
     assert payload["meta"]["chunk_seq"] == 0
 
 
