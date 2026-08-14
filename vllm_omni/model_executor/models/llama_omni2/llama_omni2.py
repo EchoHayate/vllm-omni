@@ -109,7 +109,9 @@ class Omni2Speech2SQwen2ForCausalLM(nn.Module, SupportsMultiModal):
 
     @cached_property
     def sampler(self) -> Any:
-        return getattr(self.model, "sampler", Sampler())
+        if hasattr(self.model, "sampler"):
+            return self.model.sampler
+        return Sampler()
 
     def get_language_model(self) -> nn.Module:
         getter = getattr(self.model, "get_language_model", None)
