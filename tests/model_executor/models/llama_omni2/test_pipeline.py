@@ -115,6 +115,8 @@ def test_llama_omni2_default_deploy_uses_independent_decoder_checkpoint():
     assert stages[2].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args["dtype"] == "float32"
     assert stages[2].yaml_engine_args["enforce_eager"] is True
+    assert stages[2].yaml_engine_args["enable_chunked_prefill"] is False
+    assert stages[2].yaml_engine_args["max_num_seqs"] >= 8
     assert stages[0].to_omegaconf().engine_args.model == "ICTNLP/LLaMA-Omni2-0.5B"
     assert stages[1].to_omegaconf().engine_args.model == "ICTNLP/LLaMA-Omni2-0.5B"
     assert stages[2].to_omegaconf().engine_args.model == "ICTNLP/cosy2_decoder"

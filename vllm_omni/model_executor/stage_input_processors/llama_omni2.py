@@ -61,6 +61,7 @@ class LlamaOmni2StreamState:
     thinker_finished: bool = False
     talker_finished: bool = False
     codec_finished: bool = False
+    codec_chunk_seq: int = 0
     drain_units: int = 0
 
     def consume_thinker_tokens(
@@ -390,6 +391,8 @@ def talker2code2wav_async_chunk(
     delta = state.consume_codec_tokens(codes.tolist(), finished=is_finished)
     if not delta and not (is_finished and not was_finished):
         return None
+    chunk_seq = state.codec_chunk_seq
+    state.codec_chunk_seq += 1
     return OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(
@@ -400,6 +403,7 @@ def talker2code2wav_async_chunk(
         meta=MetaStruct(
             finished=torch.tensor(is_finished, dtype=torch.bool),
             request_id=_request_id(request),
+            chunk_seq=chunk_seq,
         ),
     )
 
@@ -425,5 +429,6 @@ def talker2code2wav_full_payload(
         "meta": {
             "finished": torch.tensor(True, dtype=torch.bool),
             "request_id": _request_id(request, request_id),
+            "chunk_seq": 0,
         },
     }

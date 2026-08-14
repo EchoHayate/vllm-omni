@@ -394,7 +394,7 @@ def test_load_poll_generation_preserves_terminal_finished_metadata(
     assert adapter._poll_single_request(request) is True
 
     assert request.additional_information["meta"]["finished"].item() is True
-    assert "req-code2wav-terminal" in adapter.finished_requests
+    assert "req-code2wav-terminal" in adapter.upstream_exhausted_requests
 
 
 def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):

@@ -143,6 +143,14 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, torch.Tensor):
+        return int(value.reshape(-1)[0].item()) if value.numel() else None
+    if isinstance(value, (list, tuple)):
+        return _optional_int(value[0]) if value else None
+    return int(value) if value is not None else None
+
+
 def _request_id(info: Mapping[str, Any]) -> str | None:
     meta = info.get("meta")
     if not isinstance(meta, Mapping):
@@ -193,6 +201,7 @@ class LlamaOmni2AudioChunk:
 @dataclass
 class _Code2WavState:
     units: list[int] = field(default_factory=list)
+    chunk_seq: int = -1
     token_offset: int = 0
     sequence_index: int = 0
     mel_cache: torch.Tensor | None = None
@@ -249,6 +258,7 @@ class LlamaOmni2Code2WavCore:
     def _clone_state(state: _Code2WavState) -> _Code2WavState:
         return _Code2WavState(
             units=list(state.units),
+            chunk_seq=state.chunk_seq,
             token_offset=state.token_offset,
             sequence_index=state.sequence_index,
             mel_cache=state.mel_cache,
@@ -429,19 +439,40 @@ class LlamaOmni2Code2WavCore:
     def process_batch(
         self,
         requests: list[tuple[str, list[int], bool]],
+        *,
+        chunk_seqs: list[int | None] | None = None,
     ) -> list[LlamaOmni2AudioChunk | None]:
         request_ids = [request_id for request_id, _, _ in requests]
         if len(request_ids) != len(set(request_ids)):
             raise ValueError("duplicate LLaMA-Omni 2 Code2Wav request ids in one batch")
+        if chunk_seqs is None:
+            chunk_seqs = [None] * len(requests)
+        if len(chunk_seqs) != len(requests):
+            raise ValueError(
+                "LLaMA-Omni 2 Code2Wav chunk_seqs must align with requests"
+            )
 
         tentative: dict[str, _Code2WavState] = {}
         outputs: list[LlamaOmni2AudioChunk | None] = [None] * len(requests)
         work: list[_Code2WavWorkItem] = []
         terminal_empty: set[str] = set()
-        for output_index, (request_id, new_units, finished) in enumerate(requests):
+        for output_index, ((request_id, new_units, finished), chunk_seq) in enumerate(
+            zip(requests, chunk_seqs, strict=True)
+        ):
             if request_id in self._finished_request_ids:
                 raise ValueError(f"LLaMA-Omni 2 Code2Wav request {request_id!r} already finished")
-            state = self._clone_state(self._states.get(request_id, _Code2WavState()))
+            previous = self._states.get(request_id)
+            expected_chunk_seq = 0 if previous is None else previous.chunk_seq + 1
+            if chunk_seq is not None and chunk_seq != expected_chunk_seq:
+                raise ValueError(
+                    "LLaMA-Omni 2 Code2Wav chunk_seq must be monotonic: "
+                    f"request_id={request_id!r}, expected={expected_chunk_seq}, "
+                    f"actual={chunk_seq}"
+                )
+            state = self._clone_state(previous or _Code2WavState())
+            state.chunk_seq = (
+                expected_chunk_seq if chunk_seq is None else chunk_seq
+            )
             state.units.extend(int(unit) for unit in new_units)
             if not state.units and not finished:
                 raise ValueError("nonterminal Code2Wav chunks require codec units")
@@ -564,6 +595,7 @@ class LlamaOmni2Code2Wav(nn.Module):
             ]
 
         requests: list[tuple[str, list[int], bool]] = []
+        chunk_seqs: list[int | None] = []
         codec_units: list[torch.Tensor] = []
         for info in infos:
             info = info if isinstance(info, Mapping) else {}
@@ -578,7 +610,11 @@ class LlamaOmni2Code2Wav(nn.Module):
                     raise ValueError("LLaMA-Omni 2 Code2Wav payload is missing meta.request_id")
                 continue
             requests.append((request_id, codes, finished))
-        chunks = self.core.process_batch(requests)
+            chunk_seqs.append(_optional_int(meta.get("chunk_seq")))
+        chunks = self.core.process_batch(
+            requests,
+            chunk_seqs=chunk_seqs,
+        )
 
         return OmniOutput(
             text_hidden_states=None,

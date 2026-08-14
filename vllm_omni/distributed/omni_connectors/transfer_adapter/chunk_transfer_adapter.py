@@ -639,7 +639,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for request_id in list(self._active_streams):
             if request_ids is not None and request_id not in request_ids:
                 continue
-            if request_id in self.finished_requests:
+            if request_id in self.upstream_exhausted_requests:
                 self._active_streams.pop(request_id, None)
 
     def _promote_active_streams(self, queue: Any) -> None:

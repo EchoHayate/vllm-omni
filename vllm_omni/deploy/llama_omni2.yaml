@@ -35,7 +35,7 @@ stages:
     devices: "1"
     dtype: float32
     enforce_eager: true
-    max_num_seqs: 1
+    max_num_seqs: 8
     gpu_memory_utilization: 0.25
     async_scheduling: false
     enable_chunked_prefill: false

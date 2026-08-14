@@ -581,6 +581,35 @@ def test_core_failed_later_bucket_rolls_back_every_request():
         assert torch.equal(state.speech_cache, expected[5])
 
 
+def test_core_rejects_duplicate_chunk_seq_without_state_mutation():
+    flow = _FakeFlow()
+    core = LlamaOmni2Code2WavCore(
+        flow=flow,
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+    core.process_batch(
+        [("request-a", [1, 2], False)],
+        chunk_seqs=[0],
+    )
+    before = core._clone_state(core._states["request-a"])
+
+    with pytest.raises(ValueError, match="chunk_seq"):
+        core.process_batch(
+            [("request-a", [3, 4], False)],
+            chunk_seqs=[0],
+        )
+
+    current = core._states["request-a"]
+    assert current.units == before.units
+    assert current.token_offset == before.token_offset
+    assert current.sequence_index == before.sequence_index
+    assert current.chunk_seq == before.chunk_seq
+    assert flow.batch_sizes == [1]
+
+
 def test_core_split_cache_tensors_do_not_alias_between_requests():
     core = LlamaOmni2Code2WavCore(
         flow=_FakeFlow(),

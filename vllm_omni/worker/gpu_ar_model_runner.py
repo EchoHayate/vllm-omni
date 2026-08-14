@@ -59,6 +59,39 @@ from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
 
+_OMNI_CONNECTOR_INIT_ARCHS = frozenset(
+    {
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
+        "Omni2Speech2SQwen2ForCausalLM",
+        "CovoAudioForConditionalGeneration",
+        "MiMoAudioModel",
+        "Qwen3TTSTalkerForConditionalGeneration",
+        "Qwen3TTSCode2Wav",
+        "CosyVoice3Model",
+        "NemotronDenseForCausalLM",
+        "NemotronHForCausalLM",
+        "DyninOmniForConditionalGeneration",
+        "IndexTTS2TalkerForConditionalGeneration",
+        "NemotronVoiceChatTalkerForConditionalGeneration",
+        "NemotronVoiceChatThinkerForConditionalGeneration",
+    }
+)
+
+
+def _should_init_runner_omni_connectors(model_config: Any) -> bool:
+    if getattr(model_config, "async_chunk", False):
+        return False
+    stage_archs = set(getattr(model_config, "architectures", None) or ())
+    model_arch_override = getattr(model_config, "model_arch", None)
+    if model_arch_override:
+        stage_archs.add(model_arch_override)
+    return (
+        bool(stage_archs & _OMNI_CONNECTOR_INIT_ARCHS)
+        or get_stage_connector_role(model_config) is not None
+    )
+
+
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     if tensor.device.type == "cpu":
@@ -326,25 +359,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # separately as `(model_arch, model_stage)` tuples in
         # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
         # forgetting that produces a Stage-1 hang on the consumer.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "Omni2Speech2SQwen2ForCausalLM",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "CosyVoice3Model",
-            "NemotronDenseForCausalLM",
-            "NemotronHForCausalLM",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2TalkerForConditionalGeneration",
-            # nemotron_voicechat: the talker (stage 1) is the full-payload
-            # producer for code2wav (stage 2); the thinker (stage 0) only
-            # produces over the connector in async-chunk (streaming) mode.
-            "NemotronVoiceChatTalkerForConditionalGeneration",
-            "NemotronVoiceChatThinkerForConditionalGeneration",
-        }
         # The stage-level ``model_arch`` override may be blank so the class
         # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
         # TTA/TTS thinker stages, which bind dense on the 2B and NemotronH on
@@ -352,11 +366,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # override — otherwise a blank-override producer stage never creates
         # its worker connector and the sync full-payload flush silently never
         # runs (downstream stage starves on connector input).
-        stage_archs = set(getattr(self.model_config, "architectures", None) or ())
-        model_arch_override = getattr(self.model_config, "model_arch", None)
-        if model_arch_override:
-            stage_archs.add(model_arch_override)
-        if stage_archs & _OMNI_CONNECTOR_INIT_ARCHS or get_stage_connector_role(self.model_config) is not None:
+        if _should_init_runner_omni_connectors(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,

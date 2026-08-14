@@ -449,8 +449,10 @@ def test_talker_async_emits_only_new_codec_delta_and_terminal_once():
     assert first.codes.audio.tolist() == [100, 101]
     assert first.meta.finished.item() is False
     assert first.meta.request_id == "request-a"
+    assert first.meta.chunk_seq == 0
     assert second.codes.audio.tolist() == [102]
     assert second.meta.finished.item() is True
+    assert second.meta.chunk_seq == 1
     assert (
         talker2code2wav_async_chunk(
             manager,
@@ -518,6 +520,7 @@ def test_talker_full_payload_propagates_terminal_codec_ids():
     assert payload["codes"]["audio"].tolist() == [100, 101, 102]
     assert payload["meta"]["finished"].item() is True
     assert payload["meta"]["request_id"] == "request-a"
+    assert payload["meta"]["chunk_seq"] == 0
 
 
 def test_talker_full_payload_uses_explicit_request_id_when_request_lacks_one():
