@@ -52,8 +52,13 @@ def _decode_terminal_codec_token_ids(
     *,
     finished: bool,
 ) -> list[int]:
-    if finished and token_ids[-1:] == [TALKER_EOS_TOKEN_ID]:
-        token_ids = token_ids[:-1]
+    del finished
+    if TALKER_EOS_TOKEN_ID in token_ids:
+        eos_index = token_ids.index(TALKER_EOS_TOKEN_ID)
+        terminal_tokens = token_ids[eos_index:]
+        if any(token_id != TALKER_EOS_TOKEN_ID for token_id in terminal_tokens):
+            raise ValueError("LLaMA-Omni 2 codec tokens cannot follow the Talker EOS token")
+        token_ids = token_ids[:eos_index]
     return _decode_codec_token_ids(token_ids)
 
 
@@ -405,11 +410,11 @@ def talker2code2wav_async_chunk(
         delta,
         finished=is_finished,
     )
-    if not decoded_delta and not (is_finished and not was_finished):
-        return None
     state.codec_tokens = current
     if is_finished:
         state.codec_finished = True
+    if not decoded_delta and not (is_finished and not was_finished):
+        return None
     chunk_seq = state.codec_chunk_seq
     state.codec_chunk_seq += 1
     return OmniPayloadStruct(

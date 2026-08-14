@@ -516,6 +516,38 @@ def test_talker_async_filters_terminal_eos_without_skipping_chunk_sequence():
     assert terminal.meta.chunk_seq == 1
 
 
+def test_talker_async_defers_repeated_eos_terminal_until_finished_flag():
+    manager = _TransferManager()
+    request = _Request()
+
+    first = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766, 151643])}},
+        request,
+        is_finished=False,
+    )
+    repeated = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766, 151643, 151643, 151643])}},
+        request,
+        is_finished=False,
+    )
+    terminal = talker2code2wav_async_chunk(
+        manager,
+        {"codes": {"audio": torch.tensor([151766, 151643, 151643, 151643])}},
+        request,
+        is_finished=True,
+    )
+
+    assert first.codes.audio.tolist() == [100]
+    assert first.meta.finished.item() is False
+    assert first.meta.chunk_seq == 0
+    assert repeated is None
+    assert terminal.codes.audio.numel() == 0
+    assert terminal.meta.finished.item() is True
+    assert terminal.meta.chunk_seq == 1
+
+
 def test_talker_async_invalid_codec_token_does_not_mutate_stream_state():
     manager = _TransferManager()
     request = _Request()
@@ -571,6 +603,18 @@ def test_talker_full_payload_filters_terminal_eos():
     payload = talker2code2wav_full_payload(
         _TransferManager(),
         {"codes.audio": torch.tensor([151766, 151643])},
+        _Request(),
+    )
+
+    assert payload["codes"]["audio"].tolist() == [100]
+    assert payload["meta"]["finished"].item() is True
+    assert payload["meta"]["chunk_seq"] == 0
+
+
+def test_talker_full_payload_filters_repeated_terminal_eos():
+    payload = talker2code2wav_full_payload(
+        _TransferManager(),
+        {"codes.audio": torch.tensor([151766, 151643, 151643, 151643])},
         _Request(),
     )
 
