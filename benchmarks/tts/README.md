@@ -167,6 +167,64 @@ comparisons, add `--request-seed 42`; production-performance runs should omit
 it. The trailing `--seed 0` controls Seed-TTS row selection rather than model
 sampling.
 
+#### LLaMA-Omni2 speech-to-speech A/B
+
+Start the native three-stage server on two GPUs:
+
+```bash
+vllm serve ICTNLP/LLaMA-Omni2-0.5B \
+    --omni \
+    --deploy-config vllm_omni/deploy/llama_omni2.yaml \
+    --port 8000
+```
+
+Use a fixed JSONL dataset so before/after runs send identical speech and text.
+Every row must contain exactly `id`, `audio`, and `text`; audio paths must be
+absolute:
+
+```json
+{"id":"sample-0001","audio":"/absolute/path/prompt.wav","text":"Respond to the speaker."}
+```
+
+Run each concurrency point at least three times. Keep the server commit, model
+snapshots, GPU placement, warmups, prompt count, and dataset unchanged within
+each before/after pair:
+
+```bash
+for run in 1 2 3; do
+  python benchmarks/tts/bench_tts.py \
+      --model ICTNLP/LLaMA-Omni2-0.5B \
+      --task speech_to_speech \
+      --dataset-path /absolute/path/fixed.jsonl \
+      --concurrency 1 4 8 \
+      --num-prompts 16 32 64 \
+      --num-warmups 2 \
+      --output-dir "./results/after-run${run}"
+done
+```
+
+Aggregate explicit result files. Repeating `--label`, `--before`, and `--after`
+lets one invocation enforce the complete gate:
+
+```bash
+python benchmarks/tts/summarize_llama_omni2_runs.py \
+    --label c1 \
+    --before results/before-c1-run{1,2,3}.json \
+    --after results/after-c1-run{1,2,3}.json \
+    --label c4 \
+    --before results/before-c4-run{1,2,3}.json \
+    --after results/after-c4-run{1,2,3}.json \
+    --label c8 \
+    --before results/before-c8-run{1,2,3}.json \
+    --after results/after-c8-run{1,2,3}.json \
+    --output results/llama-omni2-gate.json
+```
+
+The command exits nonzero if c1 median TTFP or RTF regresses by more than 5%,
+or if neither c4 nor c8 improves median RTF or audio throughput by at least
+10%. The report includes median, sample standard deviation, minimum, maximum,
+and relative change for all three metrics.
+
 ### 4. Plot a sweep
 
 ```bash
@@ -185,6 +243,7 @@ Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 | `voice_clone`   | `seed-tts`        | `ref_audio` + `ref_text` + `task_type=Base`         | `Qwen3-TTS-*-Base`, `VoxCPM2`            |
 | `default_voice` | `seed-tts-text`   | `voice=Vivian` + `task_type=CustomVoice`            | `Qwen3-TTS-*-CustomVoice`                |
 | `voice_design`  | `seed-tts-design` | `instructions=<natural-language description>` + `task_type=VoiceDesign` | `Qwen3-TTS-*-CustomVoice` |
+| `speech_to_speech` | `llama-omni2-s2s` | input WAV + instruction, streamed text and audio output | `ICTNLP/LLaMA-Omni2-0.5B` |
 
 **`-CustomVoice` checkpoints do NOT ship `speaker_encoder` weights**, so
 voice_clone requests raise `ValueError` at model runtime. Use `-Base` for
@@ -216,6 +275,7 @@ Then add the model's Deploy YAML under `vllm_omni/deploy/<model>.yaml`
 | `seed_tts_smoke`   | ✅       | 4-field meta.lst  | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only) |
 | `seed-tts`         | ❌       | 4-field meta.lst + WAVs | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB) |
 | `seed-tts-text`    | ❌       | 4-field meta.lst  | Same archive as `seed-tts` (wav column unused)                 |
+| `llama-omni2-s2s`  | ❌       | fixed 3-field JSONL + absolute WAV paths | User-provided controlled A/B corpus |
 
 [seedtts]: https://github.com/BytedanceSpeech/seed-tts-eval
 
@@ -262,6 +322,8 @@ benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
 ├── plot_results.py            Generate per-task / per-concurrency curves
+├── summarize_llama_omni2_runs.py
+│                              Three-run A/B statistics and performance gate
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```
 

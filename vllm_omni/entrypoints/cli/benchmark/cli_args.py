@@ -188,6 +188,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "llama-omni2-s2s",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",

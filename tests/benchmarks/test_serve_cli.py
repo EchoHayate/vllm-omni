@@ -22,6 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
     "dataset_name",
     [
         "daily-omni",
+        "llama-omni2-s2s",
         "seed-tts",
         "seed-tts-text",
         "seed-tts-design",
