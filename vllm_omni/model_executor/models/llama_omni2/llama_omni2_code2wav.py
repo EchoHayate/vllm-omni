@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -245,6 +246,10 @@ class LlamaOmni2Code2WavCore:
         )
         self._states: dict[str, _Code2WavState] = {}
         self._finished_request_ids: set[str] = set()
+        self._profile_batch_ranges = os.getenv(
+            "VLLM_OMNI_LLAMA_OMNI2_PROFILE_BATCHES",
+            "",
+        ).lower() in {"1", "true", "yes", "on"}
         self._window = torch.from_numpy(np.hamming(2 * self.source_cache_len).astype(np.float32)).to(self.device)
 
     def __contains__(self, request_id: object) -> bool:
@@ -279,6 +284,13 @@ class LlamaOmni2Code2WavCore:
             self._tensor_shape(state.mel_cache),
             self._tensor_shape(state.source_cache),
             self._tensor_shape(state.speech_cache),
+        )
+
+    def _batch_range(self, component: str, batch_size: int):
+        if not self._profile_batch_ranges:
+            return nullcontext()
+        return torch.profiler.record_function(
+            f"llama_omni2.code2wav.{component}[batch={batch_size}]"
         )
 
     def _run_flow(
@@ -338,29 +350,30 @@ class LlamaOmni2Code2WavCore:
             device=self.device,
         )
         with torch.inference_mode():
-            mel, _ = self._run_flow(
-                token=token,
-                token_len=torch.full(
-                    (batch_size,),
-                    token.shape[1],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                prompt_token=empty_prompt_token,
-                prompt_token_len=torch.zeros(
-                    batch_size,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                prompt_feat=empty_prompt_feat,
-                prompt_feat_len=torch.zeros(
-                    batch_size,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                embedding=self.speaker_embedding.expand(batch_size, -1),
-                finished=finished,
-            )
+            with self._batch_range("flow", batch_size):
+                mel, _ = self._run_flow(
+                    token=token,
+                    token_len=torch.full(
+                        (batch_size,),
+                        token.shape[1],
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    prompt_token=empty_prompt_token,
+                    prompt_token_len=torch.zeros(
+                        batch_size,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    prompt_feat=empty_prompt_feat,
+                    prompt_feat_len=torch.zeros(
+                        batch_size,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    embedding=self.speaker_embedding.expand(batch_size, -1),
+                    finished=finished,
+                )
 
             ratio = int(getattr(self.flow, "token_mel_ratio", 1))
             mel = mel[..., states[0].token_offset * ratio :]
@@ -383,10 +396,11 @@ class LlamaOmni2Code2WavCore:
                     [state.source_cache for state in states],
                     dim=0,
                 )
-            speech, source = self.hift.inference(
-                speech_feat=mel,
-                cache_source=cache_source,
-            )
+            with self._batch_range("hift", batch_size):
+                speech, source = self.hift.inference(
+                    speech_feat=mel,
+                    cache_source=cache_source,
+                )
             if states[0].speech_cache is not None:
                 speech = _cross_fade(
                     speech,
@@ -398,7 +412,8 @@ class LlamaOmni2Code2WavCore:
             emitted = speech[..., : -self.source_cache_len]
         else:
             emitted = speech
-        emitted_cpu = emitted.to(torch.float32).detach().cpu().contiguous()
+        with self._batch_range("d2h", batch_size):
+            emitted_cpu = emitted.to(torch.float32).detach().cpu().contiguous()
         lookahead = int(getattr(self.flow, "pre_lookahead_len", 0))
         chunks: list[LlamaOmni2AudioChunk] = []
         for row, item in enumerate(items):

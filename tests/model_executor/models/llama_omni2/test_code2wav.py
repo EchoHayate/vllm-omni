@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -478,6 +479,40 @@ def test_model_batches_equal_shape_requests_in_one_flow_and_hift_call():
     assert hift.batch_sizes == [2]
     assert output.multimodal_outputs["model_outputs"][0].tolist() == [1.0, 2.0]
     assert output.multimodal_outputs["model_outputs"][1].tolist() == [8.0, 9.0]
+
+
+def test_profiler_ranges_report_batched_flow_and_hift(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_OMNI_LLAMA_OMNI2_PROFILE_BATCHES", "1")
+    ranges = []
+
+    @contextmanager
+    def record_function(name):
+        ranges.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record_function)
+    core = LlamaOmni2Code2WavCore(
+        flow=_FakeFlow(),
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+
+    core.process_batch(
+        [
+            ("request-a", [1, 2], True),
+            ("request-b", [8, 9], True),
+        ]
+    )
+
+    assert ranges == [
+        "llama_omni2.code2wav.flow[batch=2]",
+        "llama_omni2.code2wav.hift[batch=2]",
+        "llama_omni2.code2wav.d2h[batch=2]",
+    ]
 
 
 def test_core_mixed_final_work_uses_separate_exact_shape_buckets():

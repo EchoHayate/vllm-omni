@@ -229,6 +229,35 @@ completed, reports one or more failed requests, or has non-positive audio
 duration, RTF, TTFP, or throughput. This prevents an SSE or engine failure from
 being mistaken for a valid performance result.
 
+For Code2Wav attribution, start the server with both profiler variables set:
+
+```bash
+export VLLM_TORCH_PROFILER_DIR=/tmp/llama-omni2-profile
+export VLLM_OMNI_LLAMA_OMNI2_PROFILE_BATCHES=1
+```
+
+Capture only stage 2 around a representative concurrency-4 or concurrency-8
+run:
+
+```bash
+curl -X POST http://localhost:8000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"stages":[2]}'
+
+# Run the fixed-dataset benchmark while profiling is active.
+
+curl -X POST http://localhost:8000/stop_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"stages":[2]}'
+```
+
+The resulting trace contains
+`llama_omni2.code2wav.flow[batch=N]`,
+`llama_omni2.code2wav.hift[batch=N]`, and
+`llama_omni2.code2wav.d2h[batch=N]` ranges. A valid batching attribution must
+show at least one Flow and HiFT range with `N > 1`; a configuration that only
+shows `batch=1` does not prove Code2Wav batching.
+
 ### 4. Plot a sweep
 
 ```bash
