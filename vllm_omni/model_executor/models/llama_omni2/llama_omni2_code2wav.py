@@ -200,6 +200,14 @@ class _Code2WavState:
     speech_cache: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class _Code2WavWorkItem:
+    output_index: int
+    request_id: str
+    finished: bool
+    state: _Code2WavState
+
+
 class LlamaOmni2Code2WavCore:
     def __init__(
         self,
@@ -237,10 +245,248 @@ class LlamaOmni2Code2WavCore:
         self._states.pop(request_id, None)
         self._finished_request_ids.discard(request_id)
 
-    def _state_for(self, request_id: str) -> _Code2WavState:
-        if request_id in self._finished_request_ids:
-            raise ValueError(f"LLaMA-Omni 2 Code2Wav request {request_id!r} already finished")
-        return self._states.setdefault(request_id, _Code2WavState())
+    @staticmethod
+    def _clone_state(state: _Code2WavState) -> _Code2WavState:
+        return _Code2WavState(
+            units=list(state.units),
+            token_offset=state.token_offset,
+            sequence_index=state.sequence_index,
+            mel_cache=state.mel_cache,
+            source_cache=state.source_cache,
+            speech_cache=state.speech_cache,
+        )
+
+    @staticmethod
+    def _tensor_shape(value: torch.Tensor | None) -> tuple[int, ...] | None:
+        return tuple(value.shape) if value is not None else None
+
+    def _work_signature(self, item: _Code2WavWorkItem) -> tuple[Any, ...]:
+        state = item.state
+        return (
+            len(state.units),
+            state.token_offset,
+            item.finished,
+            self._tensor_shape(state.mel_cache),
+            self._tensor_shape(state.source_cache),
+            self._tensor_shape(state.speech_cache),
+        )
+
+    def _run_flow(
+        self,
+        *,
+        token: torch.Tensor,
+        token_len: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_token_len: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        prompt_feat_len: torch.Tensor,
+        embedding: torch.Tensor,
+        finished: bool,
+    ) -> tuple[torch.Tensor, Any]:
+        inference = getattr(self.flow, "inference", None)
+        if callable(inference):
+            return inference(
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+                finalize=finished,
+            )
+        return self.flow(
+            token=token,
+            token_len=token_len,
+            prompt_feat=prompt_feat,
+            prompt_feat_len=prompt_feat_len,
+            embedding=embedding,
+            streaming=not finished,
+            finalize=finished,
+        )
+
+    def _process_group(
+        self,
+        items: list[_Code2WavWorkItem],
+    ) -> list[LlamaOmni2AudioChunk]:
+        batch_size = len(items)
+        states = [item.state for item in items]
+        finished = items[0].finished
+        token = torch.tensor(
+            [state.units for state in states],
+            dtype=torch.long,
+            device=self.device,
+        )
+        empty_prompt_token = torch.zeros(
+            (batch_size, 0),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        empty_prompt_feat = torch.zeros(
+            (batch_size, 0, 80),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            mel, _ = self._run_flow(
+                token=token,
+                token_len=torch.full(
+                    (batch_size,),
+                    token.shape[1],
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                prompt_token=empty_prompt_token,
+                prompt_token_len=torch.zeros(
+                    batch_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                prompt_feat=empty_prompt_feat,
+                prompt_feat_len=torch.zeros(
+                    batch_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                embedding=self.speaker_embedding.expand(batch_size, -1),
+                finished=finished,
+            )
+
+            ratio = int(getattr(self.flow, "token_mel_ratio", 1))
+            mel = mel[..., states[0].token_offset * ratio :]
+            if states[0].mel_cache is not None:
+                mel = torch.cat(
+                    (
+                        torch.cat([state.mel_cache for state in states], dim=0),
+                        mel,
+                    ),
+                    dim=-1,
+                )
+            if states[0].source_cache is None:
+                cache_source = torch.zeros(
+                    (batch_size, 1, 0),
+                    dtype=mel.dtype,
+                    device=mel.device,
+                )
+            else:
+                cache_source = torch.cat(
+                    [state.source_cache for state in states],
+                    dim=0,
+                )
+            speech, source = self.hift.inference(
+                speech_feat=mel,
+                cache_source=cache_source,
+            )
+            if states[0].speech_cache is not None:
+                speech = _cross_fade(
+                    speech,
+                    torch.cat([state.speech_cache for state in states], dim=0),
+                    self._window,
+                )
+
+        if not finished and speech.shape[-1] >= self.source_cache_len:
+            emitted = speech[..., : -self.source_cache_len]
+        else:
+            emitted = speech
+        emitted_cpu = emitted.to(torch.float32).detach().cpu().contiguous()
+        lookahead = int(getattr(self.flow, "pre_lookahead_len", 0))
+        chunks: list[LlamaOmni2AudioChunk] = []
+        for row, item in enumerate(items):
+            state = item.state
+            state.mel_cache = mel[
+                row : row + 1,
+                ...,
+                -self.mel_cache_len :,
+            ].detach().clone()
+            state.source_cache = source[
+                row : row + 1,
+                ...,
+                -self.source_cache_len :,
+            ].detach().clone()
+            state.speech_cache = speech[
+                row : row + 1,
+                ...,
+                -self.source_cache_len :,
+            ].detach().clone()
+            state.token_offset = (
+                len(state.units)
+                if finished
+                else max(0, len(state.units) - lookahead)
+            )
+            chunks.append(
+                LlamaOmni2AudioChunk(
+                    request_id=item.request_id,
+                    audio=emitted_cpu[row].reshape(-1),
+                    sample_rate=SAMPLE_RATE,
+                    sequence_index=state.sequence_index,
+                    consumed_units=len(state.units),
+                    finished=finished,
+                )
+            )
+            state.sequence_index += 1
+        return chunks
+
+    def process_batch(
+        self,
+        requests: list[tuple[str, list[int], bool]],
+    ) -> list[LlamaOmni2AudioChunk | None]:
+        request_ids = [request_id for request_id, _, _ in requests]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("duplicate LLaMA-Omni 2 Code2Wav request ids in one batch")
+
+        tentative: dict[str, _Code2WavState] = {}
+        outputs: list[LlamaOmni2AudioChunk | None] = [None] * len(requests)
+        work: list[_Code2WavWorkItem] = []
+        terminal_empty: set[str] = set()
+        for output_index, (request_id, new_units, finished) in enumerate(requests):
+            if request_id in self._finished_request_ids:
+                raise ValueError(f"LLaMA-Omni 2 Code2Wav request {request_id!r} already finished")
+            state = self._clone_state(self._states.get(request_id, _Code2WavState()))
+            state.units.extend(int(unit) for unit in new_units)
+            if not state.units and not finished:
+                raise ValueError("nonterminal Code2Wav chunks require codec units")
+            tentative[request_id] = state
+            lookahead = int(getattr(self.flow, "pre_lookahead_len", 0))
+            if not finished and len(state.units) <= lookahead:
+                continue
+            if not state.units:
+                outputs[output_index] = LlamaOmni2AudioChunk(
+                    request_id=request_id,
+                    audio=torch.empty(0, dtype=torch.float32),
+                    sample_rate=SAMPLE_RATE,
+                    sequence_index=state.sequence_index,
+                    consumed_units=0,
+                    finished=True,
+                )
+                terminal_empty.add(request_id)
+                continue
+            work.append(
+                _Code2WavWorkItem(
+                    output_index=output_index,
+                    request_id=request_id,
+                    finished=finished,
+                    state=state,
+                )
+            )
+
+        groups: dict[tuple[Any, ...], list[_Code2WavWorkItem]] = {}
+        for item in work:
+            groups.setdefault(self._work_signature(item), []).append(item)
+        for items in groups.values():
+            chunks = self._process_group(items)
+            for item, chunk in zip(items, chunks, strict=True):
+                outputs[item.output_index] = chunk
+
+        finished_ids = terminal_empty | {
+            item.request_id for item in work if item.finished
+        }
+        for request_id, state in tentative.items():
+            if request_id in finished_ids:
+                self._states.pop(request_id, None)
+                self._finished_request_ids.add(request_id)
+            else:
+                self._states[request_id] = state
+        return outputs
 
     def process(
         self,
@@ -249,104 +495,7 @@ class LlamaOmni2Code2WavCore:
         *,
         finished: bool,
     ) -> LlamaOmni2AudioChunk | None:
-        state = self._state_for(request_id)
-        state.units.extend(int(unit) for unit in new_units)
-        if not state.units and not finished:
-            raise ValueError("nonterminal Code2Wav chunks require codec units")
-        lookahead = int(getattr(self.flow, "pre_lookahead_len", 0))
-        if not finished and len(state.units) <= lookahead:
-            return None
-        if not state.units:
-            self._states.pop(request_id, None)
-            self._finished_request_ids.add(request_id)
-            return LlamaOmni2AudioChunk(
-                request_id=request_id,
-                audio=torch.empty(0, dtype=torch.float32),
-                sample_rate=SAMPLE_RATE,
-                sequence_index=state.sequence_index,
-                consumed_units=0,
-                finished=True,
-            )
-
-        token = torch.tensor(
-            [state.units],
-            dtype=torch.long,
-            device=self.device,
-        )
-        empty_prompt_token = torch.zeros(
-            (1, 0),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        empty_prompt_feat = torch.zeros(
-            (1, 0, 80),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        with torch.inference_mode():
-            mel, _ = self.flow.inference(
-                token=token,
-                token_len=torch.tensor(
-                    [token.shape[1]],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                prompt_token=empty_prompt_token,
-                prompt_token_len=torch.tensor(
-                    [0],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                prompt_feat=empty_prompt_feat,
-                prompt_feat_len=torch.tensor(
-                    [0],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                embedding=self.speaker_embedding,
-                finalize=finished,
-            )
-
-            ratio = int(getattr(self.flow, "token_mel_ratio", 1))
-            mel = mel[..., state.token_offset * ratio :]
-            if state.mel_cache is not None:
-                mel = torch.cat([state.mel_cache, mel], dim=-1)
-            cache_source = state.source_cache
-            if cache_source is None:
-                cache_source = torch.zeros(
-                    (1, 1, 0),
-                    dtype=mel.dtype,
-                    device=mel.device,
-                )
-            speech, source = self.hift.inference(
-                speech_feat=mel,
-                cache_source=cache_source,
-            )
-            if state.speech_cache is not None:
-                speech = _cross_fade(speech, state.speech_cache, self._window)
-
-        state.mel_cache = mel[..., -self.mel_cache_len :].detach()
-        state.source_cache = source[..., -self.source_cache_len :].detach()
-        state.speech_cache = speech[..., -self.source_cache_len :].detach()
-        if not finished and speech.shape[-1] >= self.source_cache_len:
-            emitted = speech[..., : -self.source_cache_len]
-        else:
-            emitted = speech
-
-        state.token_offset = len(state.units) if finished else max(0, len(state.units) - lookahead)
-        chunk = LlamaOmni2AudioChunk(
-            request_id=request_id,
-            audio=emitted.reshape(-1).to(torch.float32).detach().cpu().contiguous(),
-            sample_rate=SAMPLE_RATE,
-            sequence_index=state.sequence_index,
-            consumed_units=len(state.units),
-            finished=finished,
-        )
-        state.sequence_index += 1
-        if finished:
-            self._states.pop(request_id, None)
-            self._finished_request_ids.add(request_id)
-        return chunk
+        return self.process_batch([(request_id, new_units, finished)])[0]
 
 
 class LlamaOmni2Code2Wav(nn.Module):
@@ -414,7 +563,7 @@ class LlamaOmni2Code2Wav(nn.Module):
                 }
             ]
 
-        chunks: list[LlamaOmni2AudioChunk | None] = []
+        requests: list[tuple[str, list[int], bool]] = []
         codec_units: list[torch.Tensor] = []
         for info in infos:
             info = info if isinstance(info, Mapping) else {}
@@ -428,12 +577,8 @@ class LlamaOmni2Code2Wav(nn.Module):
                 if codes:
                     raise ValueError("LLaMA-Omni 2 Code2Wav payload is missing meta.request_id")
                 continue
-            chunk = self.core.process(
-                request_id,
-                codes,
-                finished=finished,
-            )
-            chunks.append(chunk)
+            requests.append((request_id, codes, finished))
+        chunks = self.core.process_batch(requests)
 
         return OmniOutput(
             text_hidden_states=None,

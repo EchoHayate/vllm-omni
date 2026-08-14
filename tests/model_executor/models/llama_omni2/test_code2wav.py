@@ -21,8 +21,13 @@ class _FakeFlow(nn.Module):
     token_mel_ratio = 1
     pre_lookahead_len = 1
 
+    def __init__(self):
+        super().__init__()
+        self.batch_sizes = []
+
     def inference(self, *, token, finalize, **kwargs):
         self.last_embedding = kwargs["embedding"].detach().clone()
+        self.batch_sizes.append(int(token.shape[0]))
         del kwargs, finalize
         mel = token.to(torch.float32).unsqueeze(1)
         return mel, None
@@ -42,9 +47,50 @@ class _LookaheadFlow(_FakeFlow):
         return super().inference(token=token, finalize=finalize, **kwargs)
 
 
+class _FailingFlow(_FakeFlow):
+    def __init__(self):
+        super().__init__()
+        self.fail_token_length = None
+
+    def inference(self, *, token, finalize, **kwargs):
+        if self.fail_token_length == token.shape[1]:
+            raise RuntimeError("injected flow failure")
+        return super().inference(
+            token=token,
+            finalize=finalize,
+            **kwargs,
+        )
+
+
+class _ForwardOnlyFlow(nn.Module):
+    token_mel_ratio = 1
+    pre_lookahead_len = 1
+
+    def forward(
+        self,
+        *,
+        token,
+        token_len,
+        prompt_feat,
+        prompt_feat_len,
+        embedding,
+        streaming,
+        finalize,
+    ):
+        del token_len, prompt_feat, prompt_feat_len, embedding
+        self.last_streaming = streaming
+        self.last_finalize = finalize
+        return token.to(torch.float32).unsqueeze(1), None
+
+
 class _FakeHift(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.batch_sizes = []
+
     def inference(self, *, speech_feat, cache_source):
         del cache_source
+        self.batch_sizes.append(int(speech_feat.shape[0]))
         speech = speech_feat.flatten(1)
         source = speech.unsqueeze(1)
         return speech, source
@@ -238,6 +284,23 @@ def test_streaming_core_uses_default_english_speaker_embedding():
     assert torch.equal(flow.last_embedding, load_default_speaker_embedding())
 
 
+def test_streaming_core_calls_legacy_forward_without_monkey_patch():
+    flow = _ForwardOnlyFlow()
+    core = LlamaOmni2Code2WavCore(
+        flow=flow,
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+
+    chunk = core.process("request-forward-only", [1, 2], finished=True)
+
+    assert chunk.audio.tolist() == [1.0, 2.0]
+    assert flow.last_streaming is False
+    assert flow.last_finalize is True
+
+
 def test_streaming_core_buffers_short_nonfinal_lookahead_window_until_decodable():
     flow = _LookaheadFlow()
     core = LlamaOmni2Code2WavCore(
@@ -369,6 +432,177 @@ def test_model_forward_uses_request_scoped_runtime_payloads():
     assert output.multimodal_outputs["finished"][0].item()
     assert output.multimodal_outputs["sequence_index"][0].item() == 0
     assert output.multimodal_outputs["codec_units"][0].tolist() == [3, 4]
+
+
+def test_model_batches_equal_shape_requests_in_one_flow_and_hift_call():
+    flow = _FakeFlow()
+    hift = _FakeHift()
+    core = LlamaOmni2Code2WavCore(
+        flow=flow,
+        hift=hift,
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/unused",
+            get_hidden_size=lambda: 1,
+        ),
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+    )
+    model = LlamaOmni2Code2Wav(vllm_config=config, core=core)
+
+    output = model(
+        input_ids=torch.tensor([0]),
+        positions=torch.tensor([0]),
+        runtime_additional_information=[
+            {
+                "codes": {"audio": torch.tensor([1, 2])},
+                "meta": {
+                    "request_id": "request-a",
+                    "finished": torch.tensor(True),
+                },
+            },
+            {
+                "codes": {"audio": torch.tensor([8, 9])},
+                "meta": {
+                    "request_id": "request-b",
+                    "finished": torch.tensor(True),
+                },
+            },
+        ],
+    )
+
+    assert flow.batch_sizes == [2]
+    assert hift.batch_sizes == [2]
+    assert output.multimodal_outputs["model_outputs"][0].tolist() == [1.0, 2.0]
+    assert output.multimodal_outputs["model_outputs"][1].tolist() == [8.0, 9.0]
+
+
+def test_core_mixed_final_work_uses_separate_exact_shape_buckets():
+    flow = _FakeFlow()
+    hift = _FakeHift()
+    core = LlamaOmni2Code2WavCore(
+        flow=flow,
+        hift=hift,
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+
+    chunks = core.process_batch(
+        [
+            ("request-a", [1, 2], False),
+            ("request-b", [8, 9], True),
+        ]
+    )
+
+    assert flow.batch_sizes == [1, 1]
+    assert hift.batch_sizes == [1, 1]
+    assert not chunks[0].finished
+    assert chunks[1].finished
+    assert "request-a" in core
+    assert "request-b" not in core
+
+
+def test_core_reordered_requests_keep_state_ownership():
+    core = LlamaOmni2Code2WavCore(
+        flow=_FakeFlow(),
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+
+    core.process_batch(
+        [
+            ("request-a", [1, 2], False),
+            ("request-b", [8, 9], False),
+        ]
+    )
+    chunks = core.process_batch(
+        [
+            ("request-b", [10, 11], False),
+            ("request-a", [3, 4], False),
+        ]
+    )
+
+    assert [chunk.request_id for chunk in chunks] == ["request-b", "request-a"]
+    assert core._states["request-a"].units == [1, 2, 3, 4]
+    assert core._states["request-b"].units == [8, 9, 10, 11]
+    assert core._states["request-a"].sequence_index == 2
+    assert core._states["request-b"].sequence_index == 2
+
+
+def test_core_failed_later_bucket_rolls_back_every_request():
+    flow = _FailingFlow()
+    core = LlamaOmni2Code2WavCore(
+        flow=flow,
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+    core.process_batch(
+        [
+            ("request-a", [1, 2], False),
+            ("request-b", [8, 9], False),
+        ]
+    )
+    before = {
+        request_id: (
+            list(state.units),
+            state.token_offset,
+            state.sequence_index,
+            state.mel_cache.clone(),
+            state.source_cache.clone(),
+            state.speech_cache.clone(),
+        )
+        for request_id, state in core._states.items()
+    }
+    flow.fail_token_length = 5
+
+    with pytest.raises(RuntimeError, match="injected flow failure"):
+        core.process_batch(
+            [
+                ("request-a", [3, 4], False),
+                ("request-b", [10, 11, 12], False),
+            ]
+        )
+
+    for request_id, state in core._states.items():
+        expected = before[request_id]
+        assert state.units == expected[0]
+        assert state.token_offset == expected[1]
+        assert state.sequence_index == expected[2]
+        assert torch.equal(state.mel_cache, expected[3])
+        assert torch.equal(state.source_cache, expected[4])
+        assert torch.equal(state.speech_cache, expected[5])
+
+
+def test_core_split_cache_tensors_do_not_alias_between_requests():
+    core = LlamaOmni2Code2WavCore(
+        flow=_FakeFlow(),
+        hift=_FakeHift(),
+        device="cpu",
+        mel_cache_len=1,
+        source_cache_len=1,
+    )
+
+    core.process_batch(
+        [
+            ("request-a", [1, 2], False),
+            ("request-b", [8, 9], False),
+        ]
+    )
+
+    state_a = core._states["request-a"]
+    state_b = core._states["request-b"]
+    for name in ("mel_cache", "source_cache", "speech_cache"):
+        cache_a = getattr(state_a, name)
+        cache_b = getattr(state_b, name)
+        assert cache_a.untyped_storage().data_ptr() != cache_b.untyped_storage().data_ptr()
 
 
 def test_model_forward_exposes_codec_delta_without_audio_snapshot_while_buffering():
