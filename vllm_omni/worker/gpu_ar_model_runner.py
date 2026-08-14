@@ -86,10 +86,7 @@ def _should_init_runner_omni_connectors(model_config: Any) -> bool:
     model_arch_override = getattr(model_config, "model_arch", None)
     if model_arch_override:
         stage_archs.add(model_arch_override)
-    return (
-        bool(stage_archs & _OMNI_CONNECTOR_INIT_ARCHS)
-        or get_stage_connector_role(model_config) is not None
-    )
+    return bool(stage_archs & _OMNI_CONNECTOR_INIT_ARCHS) or get_stage_connector_role(model_config) is not None
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:

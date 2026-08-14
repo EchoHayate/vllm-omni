@@ -61,28 +61,18 @@ class LlamaOmni2S2SDataset(BenchmarkDataset):
                 continue
             value = json.loads(raw_line)
             if not isinstance(value, dict) or set(value) != cls._REQUIRED_KEYS:
-                raise ValueError(
-                    "LLaMA-Omni2 S2S rows require exactly id, audio, and text "
-                    f"(line {line_number})"
-                )
+                raise ValueError(f"LLaMA-Omni2 S2S rows require exactly id, audio, and text (line {line_number})")
             sample_id = str(value["id"]).strip()
             text = str(value["text"]).strip()
             audio_path = Path(str(value["audio"])).expanduser()
             if not sample_id or not text:
-                raise ValueError(
-                    f"LLaMA-Omni2 S2S id and text must be non-empty (line {line_number})"
-                )
+                raise ValueError(f"LLaMA-Omni2 S2S id and text must be non-empty (line {line_number})")
             if sample_id in seen_ids:
                 raise ValueError(f"duplicate LLaMA-Omni2 S2S id: {sample_id!r}")
             if not audio_path.is_absolute():
-                raise ValueError(
-                    "LLaMA-Omni2 S2S audio paths must be absolute "
-                    f"(line {line_number})"
-                )
+                raise ValueError(f"LLaMA-Omni2 S2S audio paths must be absolute (line {line_number})")
             if not audio_path.is_file():
-                raise FileNotFoundError(
-                    f"LLaMA-Omni2 S2S audio file not found: {audio_path}"
-                )
+                raise FileNotFoundError(f"LLaMA-Omni2 S2S audio file not found: {audio_path}")
             seen_ids.add(sample_id)
             rows.append(
                 _LlamaOmni2S2SRow(
@@ -123,9 +113,7 @@ class LlamaOmni2S2SDataset(BenchmarkDataset):
                             "content": [
                                 {
                                     "type": "audio_url",
-                                    "audio_url": {
-                                        "url": f"data:audio/wav;base64,{audio_b64}"
-                                    },
+                                    "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
                                 },
                                 {"type": "text", "text": row.text},
                             ],

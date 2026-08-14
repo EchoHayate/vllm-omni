@@ -7,12 +7,10 @@ from pathlib import Path
 
 import pytest
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "benchmarks" / "tts"))
 
-import bench_tts
-
+import bench_tts  # noqa: E402
 
 _CONFIG = _REPO_ROOT / "benchmarks" / "tts" / "model_configs.yaml"
 
@@ -109,9 +107,7 @@ def test_llama_omni2_dataset_builds_fixed_audio_chat_requests(
     messages = requests[0].llama_omni2_chat_messages
     assert messages[0]["role"] == "user"
     assert messages[0]["content"][0]["type"] == "audio_url"
-    assert messages[0]["content"][0]["audio_url"]["url"].startswith(
-        "data:audio/wav;base64,"
-    )
+    assert messages[0]["content"][0]["audio_url"]["url"].startswith("data:audio/wav;base64,")
     assert messages[0]["content"][1] == {
         "type": "text",
         "text": "Respond to the first speaker.",
@@ -215,9 +211,7 @@ def test_three_run_summary_reports_dispersion_and_relative_change(
 
     ttfp = summary["metrics"]["median_audio_ttfp_ms"]
     assert ttfp["before"]["median"] == 100.0
-    assert ttfp["before"]["stdev"] == pytest.approx(
-        statistics.stdev([100.0, 110.0, 90.0])
-    )
+    assert ttfp["before"]["stdev"] == pytest.approx(statistics.stdev([100.0, 110.0, 90.0]))
     assert ttfp["after"] == {
         "median": 102.0,
         "stdev": 2.0,
@@ -225,9 +219,7 @@ def test_three_run_summary_reports_dispersion_and_relative_change(
         "maximum": 104.0,
     }
     assert ttfp["relative_change_percent"] == pytest.approx(2.0)
-    assert summary["metrics"]["audio_throughput"][
-        "relative_change_percent"
-    ] == pytest.approx(20.0)
+    assert summary["metrics"]["audio_throughput"]["relative_change_percent"] == pytest.approx(20.0)
 
 
 def test_three_run_summary_rejects_failed_requests(tmp_path: Path) -> None:

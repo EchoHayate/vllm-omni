@@ -54,10 +54,7 @@ def _resolve_decoder_yaml(
         if candidate and (root / candidate).is_file():
             return root / candidate
     expected = ", ".join(name for name in candidates if name)
-    raise FileNotFoundError(
-        f"LLaMA-Omni 2 CosyVoice2 decoder is missing a supported YAML "
-        f"under {root}: {expected}"
-    )
+    raise FileNotFoundError(f"LLaMA-Omni 2 CosyVoice2 decoder is missing a supported YAML under {root}: {expected}")
 
 
 def validate_cosy2_decoder_dir(model_dir: str | os.PathLike[str]) -> Path:
@@ -289,9 +286,7 @@ class LlamaOmni2Code2WavCore:
     def _batch_range(self, component: str, batch_size: int):
         if not self._profile_batch_ranges:
             return nullcontext()
-        return torch.profiler.record_function(
-            f"llama_omni2.code2wav.{component}[batch={batch_size}]"
-        )
+        return torch.profiler.record_function(f"llama_omni2.code2wav.{component}[batch={batch_size}]")
 
     def _run_flow(
         self,
@@ -418,26 +413,34 @@ class LlamaOmni2Code2WavCore:
         chunks: list[LlamaOmni2AudioChunk] = []
         for row, item in enumerate(items):
             state = item.state
-            state.mel_cache = mel[
-                row : row + 1,
-                ...,
-                -self.mel_cache_len :,
-            ].detach().clone()
-            state.source_cache = source[
-                row : row + 1,
-                ...,
-                -self.source_cache_len :,
-            ].detach().clone()
-            state.speech_cache = speech[
-                row : row + 1,
-                ...,
-                -self.source_cache_len :,
-            ].detach().clone()
-            state.token_offset = (
-                len(state.units)
-                if finished
-                else max(0, len(state.units) - lookahead)
+            state.mel_cache = (
+                mel[
+                    row : row + 1,
+                    ...,
+                    -self.mel_cache_len :,
+                ]
+                .detach()
+                .clone()
             )
+            state.source_cache = (
+                source[
+                    row : row + 1,
+                    ...,
+                    -self.source_cache_len :,
+                ]
+                .detach()
+                .clone()
+            )
+            state.speech_cache = (
+                speech[
+                    row : row + 1,
+                    ...,
+                    -self.source_cache_len :,
+                ]
+                .detach()
+                .clone()
+            )
+            state.token_offset = len(state.units) if finished else max(0, len(state.units) - lookahead)
             chunks.append(
                 LlamaOmni2AudioChunk(
                     request_id=item.request_id,
@@ -463,9 +466,7 @@ class LlamaOmni2Code2WavCore:
         if chunk_seqs is None:
             chunk_seqs = [None] * len(requests)
         if len(chunk_seqs) != len(requests):
-            raise ValueError(
-                "LLaMA-Omni 2 Code2Wav chunk_seqs must align with requests"
-            )
+            raise ValueError("LLaMA-Omni 2 Code2Wav chunk_seqs must align with requests")
 
         tentative: dict[str, _Code2WavState] = {}
         outputs: list[LlamaOmni2AudioChunk | None] = [None] * len(requests)
@@ -485,9 +486,7 @@ class LlamaOmni2Code2WavCore:
                     f"actual={chunk_seq}"
                 )
             state = self._clone_state(previous or _Code2WavState())
-            state.chunk_seq = (
-                expected_chunk_seq if chunk_seq is None else chunk_seq
-            )
+            state.chunk_seq = expected_chunk_seq if chunk_seq is None else chunk_seq
             state.units.extend(int(unit) for unit in new_units)
             if not state.units and not finished:
                 raise ValueError("nonterminal Code2Wav chunks require codec units")
@@ -523,9 +522,7 @@ class LlamaOmni2Code2WavCore:
             for item, chunk in zip(items, chunks, strict=True):
                 outputs[item.output_index] = chunk
 
-        finished_ids = terminal_empty | {
-            item.request_id for item in work if item.finished
-        }
+        finished_ids = terminal_empty | {item.request_id for item in work if item.finished}
         for request_id, state in tentative.items():
             if request_id in finished_ids:
                 self._states.pop(request_id, None)

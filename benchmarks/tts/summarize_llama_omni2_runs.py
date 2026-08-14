@@ -8,7 +8,6 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-
 _METRICS = (
     "median_audio_ttfp_ms",
     "median_audio_rtf",
@@ -18,12 +17,7 @@ _METRICS = (
 
 def _positive_finite(payload: dict[str, Any], path: Path, metric: str) -> float:
     value = payload.get(metric)
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{path} has no positive {metric}")
     return float(value)
 
@@ -32,28 +26,19 @@ def _validate_run_payload(payload: dict[str, Any], path: Path) -> None:
     num_prompts = payload.get("num_prompts")
     completed = payload.get("completed")
     failed = payload.get("failed")
-    if not all(
-        isinstance(value, int) and not isinstance(value, bool)
-        for value in (num_prompts, completed, failed)
-    ):
-        raise ValueError(
-            f"{path} must report integer num_prompts, completed, and failed"
-        )
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in (num_prompts, completed, failed)):
+        raise ValueError(f"{path} must report integer num_prompts, completed, and failed")
     if failed != 0:
         raise ValueError(f"{path} reported failed={failed}")
     if num_prompts <= 0 or completed != num_prompts:
-        raise ValueError(
-            f"{path} completed={completed}, expected num_prompts={num_prompts}"
-        )
+        raise ValueError(f"{path} completed={completed}, expected num_prompts={num_prompts}")
     _positive_finite(payload, path, "total_audio_duration_s")
     _positive_finite(payload, path, "median_audio_duration_s")
 
 
 def _load_metric_values(paths: list[Path], metric: str) -> list[float]:
     if len(paths) < 3:
-        raise ValueError(
-            f"LLaMA-Omni2 comparisons require at least three runs, got {len(paths)}"
-        )
+        raise ValueError(f"LLaMA-Omni2 comparisons require at least three runs, got {len(paths)}")
     values: list[float] = []
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -87,9 +72,7 @@ def summarize_comparison(
         metrics[metric] = {
             "before": before,
             "after": after,
-            "relative_change_percent": (
-                (after["median"] - before_median) / before_median * 100.0
-            ),
+            "relative_change_percent": ((after["median"] - before_median) / before_median * 100.0),
         }
     return {
         "label": label,
@@ -104,9 +87,7 @@ def _relative_change(
     label: str,
     metric: str,
 ) -> float:
-    return float(
-        comparisons[label]["metrics"][metric]["relative_change_percent"]
-    )
+    return float(comparisons[label]["metrics"][metric]["relative_change_percent"])
 
 
 def _strictly_greater(value: float, threshold: float) -> bool:
@@ -152,17 +133,11 @@ def evaluate_gate(
             "median_audio_rtf",
         )
         if _strictly_greater(ttfp_change, 5.0):
-            reasons.append(
-                f"c1 median TTFP regressed {ttfp_change:.2f}% (> 5%)"
-            )
+            reasons.append(f"c1 median TTFP regressed {ttfp_change:.2f}% (> 5%)")
         if _strictly_greater(rtf_change, 5.0):
-            reasons.append(
-                f"c1 median RTF regressed {rtf_change:.2f}% (> 5%)"
-            )
+            reasons.append(f"c1 median RTF regressed {rtf_change:.2f}% (> 5%)")
 
-    high_concurrency_labels = [
-        label for label in ("c4", "c8") if label in comparisons
-    ]
+    high_concurrency_labels = [label for label in ("c4", "c8") if label in comparisons]
     if high_concurrency_labels:
         high_concurrency_passed = any(
             _at_least(
@@ -184,10 +159,7 @@ def evaluate_gate(
                 )
                 for label in high_concurrency_labels
             )
-            reasons.append(
-                "neither c4 nor c8 improved audio throughput or median RTF "
-                f"by at least 10% ({details})"
-            )
+            reasons.append(f"neither c4 nor c8 improved audio throughput or median RTF by at least 10% ({details})")
 
     return not reasons, reasons
 
@@ -195,8 +167,7 @@ def evaluate_gate(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Aggregate controlled before/after LLaMA-Omni2 benchmark runs and "
-            "enforce the c1/c4/c8 performance gate."
+            "Aggregate controlled before/after LLaMA-Omni2 benchmark runs and enforce the c1/c4/c8 performance gate."
         )
     )
     parser.add_argument("--label", action="append", required=True)
@@ -220,12 +191,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if not (
-        len(args.label) == len(args.before) == len(args.after)
-    ):
-        raise SystemExit(
-            "each --label must have one matching --before and --after group"
-        )
+    if not (len(args.label) == len(args.before) == len(args.after)):
+        raise SystemExit("each --label must have one matching --before and --after group")
     comparisons = {
         label: summarize_comparison(
             before_paths=before,

@@ -272,12 +272,7 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = (
-        is_daily_omni
-        or is_seed_tts
-        or is_llama_omni2_s2s
-        or args.dataset_name == "random-mm"
-    )
+    is_omni_dataset = is_daily_omni or is_seed_tts or is_llama_omni2_s2s or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -397,14 +392,10 @@ def get_samples(args, tokenizer):
 
     if is_llama_omni2_s2s:
         if args.backend != "openai-chat-omni":
-            raise ValueError(
-                "LLaMA-Omni2 S2S requires --backend openai-chat-omni"
-            )
+            raise ValueError("LLaMA-Omni2 S2S requires --backend openai-chat-omni")
         dataset_path = getattr(args, "dataset_path", None)
         if not dataset_path:
-            raise ValueError(
-                "LLaMA-Omni2 S2S requires --dataset-path pointing to fixed JSONL"
-            )
+            raise ValueError("LLaMA-Omni2 S2S requires --dataset-path pointing to fixed JSONL")
         dataset = LlamaOmni2S2SDataset(
             dataset_path=dataset_path,
             random_seed=args.seed,
