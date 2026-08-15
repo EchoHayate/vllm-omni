@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageBinding, PageState
 from vllm_omni.diffusion.diffusion_kv.transfer import (
     PageCopy,
@@ -77,6 +78,7 @@ def _direct_manager(
     generation: int = 1,
     clock: FakeClock | None = None,
     copy_fn=None,
+    metrics: DiffusionPageMetrics | None = None,
 ):
     event = event or FakeEvent()
     clock = clock or FakeClock()
@@ -104,6 +106,7 @@ def _direct_manager(
         clock=clock,
         event_factory=lambda: event,
         copy_fn=copy_fn,
+        metrics=metrics,
     )
     manager.register_binding(binding)
     manager.register_endpoint(source_endpoint, source)
@@ -125,6 +128,105 @@ def test_direct_copy_commits_only_after_event_completion() -> None:
     assert result is not None
     assert result.status == "completed"
     assert binding.is_compute_ready
+
+
+def test_completed_transfer_reports_lifecycle_metrics_and_terminal_snapshot() -> None:
+    event = FakeEvent(complete=False)
+    clock = FakeClock(now=1.0)
+    metrics = DiffusionPageMetrics()
+    manager, _, plan, _, _ = _direct_manager(
+        event=event,
+        generation=3,
+        clock=clock,
+        metrics=metrics,
+    )
+
+    reservation = manager.prepare_receive(plan)
+    expected_bytes = plan.pages[0].destination.num_bytes
+    assert metrics.staging_bytes == expected_bytes
+    assert metrics.staging_bytes_high_water == expected_bytes
+
+    clock.now = 2.5
+    handle = manager.send_pages(plan, reservation)
+    assert metrics.local_kv_wait_s == pytest.approx(1.5)
+    assert metrics.in_flight_bytes == expected_bytes
+    assert metrics.in_flight_bytes_high_water == expected_bytes
+
+    clock.now = 4.0
+    event.complete = True
+    result = manager.poll_completion(handle)
+
+    assert result is not None
+    assert result.status == "completed"
+    assert metrics.stable_pages_imported == 1
+    assert metrics.stable_pages_committed == 1
+    assert metrics.transferred_bytes == expected_bytes
+    assert metrics.local_install_latency_s == pytest.approx(1.5)
+    assert metrics.staging_bytes == 0
+    assert metrics.in_flight_bytes == 0
+    assert metrics.terminal_snapshots[-1] == {
+        "request_id": "req",
+        "allocation_generation": 3,
+        "session_id": "session",
+        "tp_rank": 0,
+        "page_count": 1,
+        "transferred_bytes": expected_bytes,
+        "terminal_status": "completed",
+    }
+
+
+def test_transfer_reports_stale_duplicate_cancellation_and_timeout_counts() -> None:
+    stale_metrics = DiffusionPageMetrics()
+    stale_manager, _, stale_plan, _, _ = _direct_manager(metrics=stale_metrics)
+    stale_manager.open_session(stale_plan)
+    stale_manager.unregister_binding("req", allocation_generation=1)
+    assert stale_manager.complete_for_test(stale_plan.identity).status == "stale"
+    assert stale_metrics.stale_completions == 1
+
+    duplicate_metrics = DiffusionPageMetrics()
+    duplicate_manager, _, duplicate_plan, _, _ = _direct_manager(metrics=duplicate_metrics)
+    duplicate_handle = duplicate_manager.send_pages(
+        duplicate_plan,
+        duplicate_manager.prepare_receive(duplicate_plan),
+    )
+    assert duplicate_manager.poll_completion(duplicate_handle) is not None
+    assert duplicate_manager.poll_completion(duplicate_handle) is not None
+    assert duplicate_metrics.duplicate_completions == 1
+
+    cancellation_metrics = DiffusionPageMetrics()
+    cancellation_manager, _, cancellation_plan, _, _ = _direct_manager(metrics=cancellation_metrics)
+    cancellation_manager.cancel(cancellation_manager.prepare_receive(cancellation_plan))
+    assert cancellation_metrics.cancellations == 1
+    assert cancellation_metrics.staging_bytes == 0
+    assert cancellation_metrics.terminal_snapshots[-1]["page_count"] == 1
+    assert cancellation_metrics.terminal_snapshots[-1]["transferred_bytes"] == 0
+
+    timeout_metrics = DiffusionPageMetrics()
+    timeout_clock = FakeClock(now=1.0)
+    timeout_manager, _, timeout_plan, _, _ = _direct_manager(
+        event=FakeEvent(complete=False),
+        clock=timeout_clock,
+        metrics=timeout_metrics,
+    )
+    timeout_handle = timeout_manager.send_pages(
+        timeout_plan,
+        timeout_manager.prepare_receive(timeout_plan),
+    )
+    timeout_clock.now = 11.0
+    assert timeout_manager.poll_completion(timeout_handle) is not None
+    assert timeout_metrics.timeouts == 1
+    assert timeout_metrics.staging_bytes == 0
+    assert timeout_metrics.in_flight_bytes == 0
+
+
+def test_reference_gather_metrics_are_recorded_without_tensor_reads() -> None:
+    metrics = DiffusionPageMetrics()
+    manager, _, _, _, _ = _direct_manager(metrics=metrics)
+
+    manager.record_reference_gather(num_bytes=8192, latency_s=0.25)
+
+    assert metrics.reference_gather_bytes == 8192
+    assert metrics.reference_gather_latency_s == pytest.approx(0.25)
 
 
 def test_stale_generation_never_commits_new_binding() -> None:

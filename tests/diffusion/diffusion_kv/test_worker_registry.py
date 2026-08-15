@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_omni.diffusion.diffusion_kv.worker_registry as worker_registry_module
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
@@ -82,6 +83,7 @@ def _registry(
     num_heads: int = 2,
     head_size: int = 8,
     layer_names: tuple[str, ...] = ("layer0",),
+    metrics: DiffusionPageMetrics | None = None,
 ) -> WorkerPageRegistry:
     spec = _spec(
         block_size=block_size,
@@ -103,6 +105,7 @@ def _registry(
         device=torch.device("cpu"),
         max_num_reqs=4,
         max_model_len=32,
+        metrics=metrics,
     )
 
 
@@ -182,6 +185,31 @@ def test_registry_binds_scheduler_ids_without_allocating_new_ids(monkeypatch) ->
     assert binding.sequences[0].stable.block_ids == (3,)
     assert binding.sequences[0].dynamic.block_ids == (5,)
     assert binding.sequences[0].slot_mapping.tolist() == list(range(12, 16)) + list(range(20, 24))
+
+
+def test_registry_reports_requested_pages_and_page_pool_utilization(monkeypatch) -> None:
+    metrics = DiffusionPageMetrics()
+    registry = _registry(monkeypatch, num_blocks=8, metrics=metrics)
+
+    registry.bind_request(
+        _metadata(
+            request_id="req",
+            generation=3,
+            imported_prefix_token_count=4,
+        )
+    )
+
+    assert metrics.stable_pages_requested == 1
+    assert metrics.page_pool_pages_in_use == 2
+    assert metrics.page_pool_total_pages == 8
+    assert metrics.page_pool_utilization == pytest.approx(0.25)
+    assert metrics.page_pool_utilization_high_water == pytest.approx(0.25)
+
+    registry.release_request("req", allocation_generation=3)
+
+    assert metrics.page_pool_pages_in_use == 0
+    assert metrics.page_pool_utilization == 0.0
+    assert metrics.page_pool_utilization_high_water == pytest.approx(0.25)
 
 
 def test_registry_zeroes_only_pages_entering_reserved_state(monkeypatch) -> None:

@@ -601,6 +601,77 @@ def resolve_model_class_name(
     return None
 
 
+@dataclass(slots=True)
+class DiffusionPageMetrics:
+    stable_pages_requested: int = 0
+    stable_pages_imported: int = 0
+    stable_pages_committed: int = 0
+    transferred_bytes: int = 0
+    local_install_latency_s: float = 0.0
+    local_kv_wait_s: float = 0.0
+    stale_completions: int = 0
+    duplicate_completions: int = 0
+    cancellations: int = 0
+    timeouts: int = 0
+    page_pool_pages_in_use: int = 0
+    page_pool_total_pages: int = 0
+    page_pool_utilization: float = 0.0
+    page_pool_utilization_high_water: float = 0.0
+    staging_bytes: int = 0
+    staging_bytes_high_water: int = 0
+    in_flight_bytes: int = 0
+    in_flight_bytes_high_water: int = 0
+    reference_gather_bytes: int = 0
+    reference_gather_latency_s: float = 0.0
+    terminal_snapshots: list[dict[str, object]] = field(default_factory=list)
+
+    def update_page_pool(self, *, pages_in_use: int, total_pages: int) -> None:
+        if pages_in_use < 0 or total_pages <= 0 or pages_in_use > total_pages:
+            raise ValueError(
+                "page pool usage must satisfy 0 <= pages_in_use <= total_pages, "
+                f"got pages_in_use={pages_in_use}, total_pages={total_pages}"
+            )
+        self.page_pool_pages_in_use = pages_in_use
+        self.page_pool_total_pages = total_pages
+        self.page_pool_utilization = pages_in_use / total_pages
+        self.page_pool_utilization_high_water = max(
+            self.page_pool_utilization_high_water,
+            self.page_pool_utilization,
+        )
+
+    def add_staging_bytes(self, num_bytes: int) -> None:
+        if num_bytes < 0:
+            raise ValueError(f"staging byte count must be non-negative, got {num_bytes}")
+        self.staging_bytes += num_bytes
+        self.staging_bytes_high_water = max(
+            self.staging_bytes_high_water,
+            self.staging_bytes,
+        )
+
+    def remove_staging_bytes(self, num_bytes: int) -> None:
+        if num_bytes < 0 or num_bytes > self.staging_bytes:
+            raise ValueError(
+                f"staging byte release exceeds current usage, got release={num_bytes}, current={self.staging_bytes}"
+            )
+        self.staging_bytes -= num_bytes
+
+    def add_in_flight_bytes(self, num_bytes: int) -> None:
+        if num_bytes < 0:
+            raise ValueError(f"in-flight byte count must be non-negative, got {num_bytes}")
+        self.in_flight_bytes += num_bytes
+        self.in_flight_bytes_high_water = max(
+            self.in_flight_bytes_high_water,
+            self.in_flight_bytes,
+        )
+
+    def remove_in_flight_bytes(self, num_bytes: int) -> None:
+        if num_bytes < 0 or num_bytes > self.in_flight_bytes:
+            raise ValueError(
+                f"in-flight byte release exceeds current usage, got release={num_bytes}, current={self.in_flight_bytes}"
+            )
+        self.in_flight_bytes -= num_bytes
+
+
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)

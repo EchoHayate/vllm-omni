@@ -11,6 +11,7 @@ from typing import Literal
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageBinding, PageState
 
 TransferIdentity = tuple[str, int, int, int]
@@ -135,6 +136,10 @@ class _TransferSession:
     plan: PageTransferPlan
     state: TransferState
     created_monotonic_s: float
+    target_ready_monotonic_s: float | None = None
+    transfer_started_monotonic_s: float | None = None
+    staging_bytes: int = 0
+    in_flight_bytes: int = 0
     event: object | None = None
     result: PageTransferResult | None = None
 
@@ -148,6 +153,7 @@ class PageTransferSessionManager:
         clock: Callable[[], float] = time.monotonic,
         event_factory: Callable[[], object] | None = None,
         copy_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+        metrics: DiffusionPageMetrics | None = None,
     ) -> None:
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
@@ -156,6 +162,7 @@ class PageTransferSessionManager:
         self._clock = clock
         self._event_factory = event_factory
         self._copy_fn = copy_fn
+        self.metrics = metrics or getattr(registry, "metrics", None) or DiffusionPageMetrics()
         self._bindings: dict[str, DiffusionPageBinding] = {}
         self._endpoints: dict[PageEndpoint, torch.Tensor] = {}
         self._sessions: dict[TransferIdentity, _TransferSession] = {}
@@ -213,6 +220,8 @@ class PageTransferSessionManager:
             return PageReceiveReservation(identity)
         if session.state is TransferState.TRANSFERRING:
             return PageReceiveReservation(identity)
+        if session.state is TransferState.TARGET_READY:
+            return PageReceiveReservation(identity)
         for page_copy in plan.pages:
             self._validate_copy_geometry(page_copy)
             if page_copy.destination not in self._endpoints:
@@ -222,6 +231,9 @@ class PageTransferSessionManager:
             if source is not None and self._tensors_overlap(source, destination):
                 raise ValueError("source and destination page spans overlap")
         session.state = TransferState.TARGET_READY
+        session.target_ready_monotonic_s = self._clock()
+        session.staging_bytes = self._plan_num_bytes(plan)
+        self.metrics.add_staging_bytes(session.staging_bytes)
         return PageReceiveReservation(identity)
 
     def send_pages(
@@ -235,11 +247,21 @@ class PageTransferSessionManager:
         if session is None:
             raise KeyError(f"transfer session {plan.identity!r} is not allocated")
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return plan.identity
         if session.state is not TransferState.TARGET_READY:
             raise ValueError(f"transfer session is not target-ready: {session.state.value}")
 
+        transfer_started = self._clock()
         session.state = TransferState.TRANSFERRING
+        session.transfer_started_monotonic_s = transfer_started
+        if session.target_ready_monotonic_s is not None:
+            self.metrics.local_kv_wait_s += max(
+                0.0,
+                transfer_started - session.target_ready_monotonic_s,
+            )
+        session.in_flight_bytes = self._plan_num_bytes(plan)
+        self.metrics.add_in_flight_bytes(session.in_flight_bytes)
         try:
             for page_copy in plan.pages:
                 self._validate_copy_geometry(page_copy)
@@ -269,6 +291,7 @@ class PageTransferSessionManager:
     ) -> PageTransferResult | None:
         session = self._get_session(identity)
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return session.result
         if session.state is not TransferState.TRANSFERRING:
             return None
@@ -291,6 +314,7 @@ class PageTransferSessionManager:
         if binding is None or binding.allocation_generation != session.plan.allocation_generation:
             return self._set_terminal(session, TransferState.STALE)
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return session.result
         return self._complete_session(session)
 
@@ -300,6 +324,7 @@ class PageTransferSessionManager:
     ) -> PageTransferResult:
         session = self._get_session(identity)
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return session.result
         if session.state is not TransferState.TARGET_READY:
             raise ValueError(f"external page copy can complete only from target_ready, got {session.state.value}")
@@ -312,6 +337,7 @@ class PageTransferSessionManager:
     ) -> PageTransferResult:
         session = self._get_session(identity)
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return session.result
         return self._set_terminal(session, TransferState.FAILED, message=message)
 
@@ -321,8 +347,22 @@ class PageTransferSessionManager:
     ) -> PageTransferResult:
         session = self._get_session(identity)
         if session.result is not None:
+            self.metrics.duplicate_completions += 1
             return session.result
         return self._set_terminal(session, TransferState.CANCELLED)
+
+    def record_reference_gather(
+        self,
+        *,
+        num_bytes: int,
+        latency_s: float,
+    ) -> None:
+        if num_bytes < 0:
+            raise ValueError(f"reference gather bytes must be non-negative, got {num_bytes}")
+        if latency_s < 0:
+            raise ValueError(f"reference gather latency must be non-negative, got {latency_s}")
+        self.metrics.reference_gather_bytes += num_bytes
+        self.metrics.reference_gather_latency_s += latency_s
 
     def close_session(self, session_id: str) -> None:
         for identity in tuple(self._session_identities.get(session_id, ())):
@@ -382,6 +422,33 @@ class PageTransferSessionManager:
         completed_pages: tuple[int, ...] = (),
         message: str = "",
     ) -> PageTransferResult:
+        completed_at = self._clock()
+        if session.staging_bytes:
+            self.metrics.remove_staging_bytes(session.staging_bytes)
+            session.staging_bytes = 0
+        if session.in_flight_bytes:
+            self.metrics.remove_in_flight_bytes(session.in_flight_bytes)
+            session.in_flight_bytes = 0
+
+        page_count = len({page_copy.destination.block_id for page_copy in session.plan.pages})
+        transferred_bytes = 0
+        if state is TransferState.COMPLETED:
+            transferred_bytes = self._plan_num_bytes(session.plan)
+            self.metrics.stable_pages_imported += page_count
+            self.metrics.stable_pages_committed += page_count
+            self.metrics.transferred_bytes += transferred_bytes
+            if session.transfer_started_monotonic_s is not None:
+                self.metrics.local_install_latency_s += max(
+                    0.0,
+                    completed_at - session.transfer_started_monotonic_s,
+                )
+        elif state is TransferState.STALE:
+            self.metrics.stale_completions += 1
+        elif state is TransferState.CANCELLED:
+            self.metrics.cancellations += 1
+        elif state is TransferState.TIMED_OUT:
+            self.metrics.timeouts += 1
+
         session.state = state
         session.result = PageTransferResult(
             identity=session.plan.identity,
@@ -389,7 +456,22 @@ class PageTransferSessionManager:
             completed_pages=completed_pages,
             message=message,
         )
+        self.metrics.terminal_snapshots.append(
+            {
+                "request_id": session.plan.request_id,
+                "allocation_generation": session.plan.allocation_generation,
+                "session_id": session.plan.session_id,
+                "tp_rank": session.plan.target_tp_rank,
+                "page_count": page_count,
+                "transferred_bytes": transferred_bytes,
+                "terminal_status": state.value,
+            }
+        )
         return session.result
+
+    @staticmethod
+    def _plan_num_bytes(plan: PageTransferPlan) -> int:
+        return sum(page_copy.destination.num_bytes for page_copy in plan.pages)
 
     def _get_session(
         self,

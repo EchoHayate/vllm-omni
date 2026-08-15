@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.block_table import BlockTable
 
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
@@ -96,6 +97,7 @@ class WorkerPageRegistry:
         device: torch.device,
         max_num_reqs: int,
         max_model_len: int,
+        metrics: DiffusionPageMetrics | None = None,
     ) -> None:
         if kv_cache_config.num_blocks <= 0:
             raise ValueError("kv_cache_config.num_blocks must be positive")
@@ -115,6 +117,8 @@ class WorkerPageRegistry:
         self._active_bindings: dict[str, _ActiveBinding] = {}
         self._page_owners: dict[tuple[int, int], tuple[str, int, int]] = {}
         self._free_rows = list(reversed(range(max_num_reqs)))
+        self.metrics = metrics or DiffusionPageMetrics()
+        self._update_page_pool_metrics()
 
     def _validate_layer_specs(self) -> dict[str, int]:
         configured_layers: set[str] = set()
@@ -348,6 +352,8 @@ class WorkerPageRegistry:
                 row_indices=row_indices,
                 owned_pages=tuple(owned_pages),
             )
+            self.metrics.stable_pages_requested += len(externally_required)
+            self._update_page_pool_metrics()
             return binding
         except Exception:
             for row_index in row_indices:
@@ -426,3 +432,10 @@ class WorkerPageRegistry:
             self._page_owners.pop(page, None)
         self._active_bindings.pop(request_id)
         self._free_rows.extend(active.row_indices)
+        self._update_page_pool_metrics()
+
+    def _update_page_pool_metrics(self) -> None:
+        self.metrics.update_page_pool(
+            pages_in_use=len(self._page_owners),
+            total_pages=self.kv_cache_config.num_blocks * len(self.kv_cache_config.kv_cache_groups),
+        )
