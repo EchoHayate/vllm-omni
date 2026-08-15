@@ -201,7 +201,9 @@ def _run_hunyuan(
 
 
 @pytest.fixture(scope="module")
-def hunyuan_page_native_matrix(tmp_path_factory: pytest.TempPathFactory) -> dict[tuple[float, int], tuple[_RunResult, _RunResult]]:
+def hunyuan_page_native_matrix(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[tuple[float, int], tuple[_RunResult, _RunResult]]:
     old_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
     os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
     root = tmp_path_factory.mktemp("hunyuan-page-native")
@@ -307,11 +309,7 @@ def _assert_paged_rank_snapshots(
         assert metrics["stable_pages_requested"] > 0
         assert metrics["reference_gather_bytes"] > 0
         assert metrics["page_pool_pages_in_use"] == 0
-        released = [
-            terminal
-            for terminal in metrics["terminal_snapshots"]
-            if terminal["terminal_status"] == "released"
-        ]
+        released = [terminal for terminal in metrics["terminal_snapshots"] if terminal["terminal_status"] == "released"]
         assert released
         generations.add(int(released[-1]["allocation_generation"]))
     assert len(generations) == 1
@@ -407,39 +405,19 @@ def test_hunyuan_image3_paged_kv_dp2_tp2_keeps_idle_replica_clean(
     )
 
     assert len(paged.snapshots) == 4
-    active = [
-        snapshot
-        for snapshot in paged.snapshots
-        if snapshot["data_parallel_rank"] == 0
-    ]
-    idle = [
-        snapshot
-        for snapshot in paged.snapshots
-        if snapshot["data_parallel_rank"] == 1
-    ]
-    assert {
-        snapshot["tensor_parallel_rank"]
-        for snapshot in active
-    } == {0, 1}
-    assert {
-        snapshot["tensor_parallel_rank"]
-        for snapshot in idle
-    } == {0, 1}
+    active = [snapshot for snapshot in paged.snapshots if snapshot["data_parallel_rank"] == 0]
+    idle = [snapshot for snapshot in paged.snapshots if snapshot["data_parallel_rank"] == 1]
+    assert {snapshot["tensor_parallel_rank"] for snapshot in active} == {0, 1}
+    assert {snapshot["tensor_parallel_rank"] for snapshot in idle} == {0, 1}
 
     active_generations: set[int] = set()
     for snapshot in active:
         assert snapshot["active_bindings"] == []
         metrics = snapshot["metrics"]
         assert metrics["stable_pages_requested"] > 0
-        released = [
-            terminal
-            for terminal in metrics["terminal_snapshots"]
-            if terminal["terminal_status"] == "released"
-        ]
+        released = [terminal for terminal in metrics["terminal_snapshots"] if terminal["terminal_status"] == "released"]
         assert released
-        active_generations.add(
-            int(released[-1]["allocation_generation"])
-        )
+        active_generations.add(int(released[-1]["allocation_generation"]))
     assert len(active_generations) == 1
 
     for snapshot in idle:
@@ -712,4 +690,3 @@ def test_hunyuan_page_native_cuda_import_partial_prefix_and_cancel() -> None:
     assert cancel_binding.page_states[7] is PageState.INSTALLING_LOCAL
     assert cancel_manager.metrics.cancellations == 1
     assert cancel_manager.metrics.terminal_snapshots[-1]["terminal_status"] == "cancelled"
-
