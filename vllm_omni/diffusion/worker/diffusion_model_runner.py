@@ -938,8 +938,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary and record_output_peak_memory:
-                current_omni_platform.reset_peak_memory_stats()
+            reset_peak_memory_stats = getattr(current_omni_platform, "reset_peak_memory_stats", None)
+            max_memory_reserved = getattr(current_omni_platform, "max_memory_reserved", None)
+            max_memory_allocated = getattr(current_omni_platform, "max_memory_allocated", None)
+            can_record_peak_memory = (
+                is_primary
+                and record_output_peak_memory
+                and callable(reset_peak_memory_stats)
+                and callable(max_memory_reserved)
+                and callable(max_memory_allocated)
+            )
+            if can_record_peak_memory:
+                reset_peak_memory_stats()
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
@@ -955,7 +965,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         pipeline_name=type(self.pipeline).__name__,
                     )
 
-            if is_primary and outputs and record_output_peak_memory:
+            if can_record_peak_memory and outputs:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
                 for output in outputs:
                     output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)

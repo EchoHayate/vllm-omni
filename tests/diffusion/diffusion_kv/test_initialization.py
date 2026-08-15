@@ -294,4 +294,4 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
     )
 
     assert vllm_config.model_config.original_max_model_len == -1
-    assert vllm_config.model_config.max_model_len == 256
+    assert vllm_config.model_config.max_model_len == 16 * spec.block_size
