@@ -935,6 +935,18 @@ W2b is complete only when:
 7. Controlled end-to-end A/B demonstrates the claimed benefit and reports
    cold-path tradeoffs.
 
+## Implementation Base
+
+W2a implementation started from:
+
+- `origin/main`: `555336e887da035aa473754d3f87ca7d8eb878a4`
+- control-plane base: `7e2245e22c5d5df6497a0740873f261f20a7f7ca`
+- `DiffusionKVMetadata` provider:
+  `af3faa6c1e502c92e79637eab15485b7cc5bf356`
+
+The implementation consumes the control-plane types directly and does not
+duplicate Scheduler allocation.
+
 ## 21. Rejected Alternatives
 
 ### 21.1 Continue optimizing dense H2D copies
