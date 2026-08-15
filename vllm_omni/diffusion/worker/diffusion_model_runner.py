@@ -1005,8 +1005,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=od_config,
                 diffusion_page_bindings=diffusion_page_bindings,
                 diffusion_page_metrics=(
-                    self.page_registry.metrics
-                    if diffusion_page_bindings is not None and self.page_registry is not None
+                    page_registry.metrics
+                    if diffusion_page_bindings is not None
+                    and (page_registry := getattr(self, "page_registry", None)) is not None
                     else None
                 ),
             ):
