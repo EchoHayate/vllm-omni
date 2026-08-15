@@ -452,6 +452,38 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             registry=self.page_registry,
             timeout_s=getattr(self.od_config, "diffusion_page_transfer_timeout_s", 30.0),
         )
+        self._install_paged_kv_caches()
+
+    def _install_paged_kv_caches(self) -> None:
+        from vllm_omni.diffusion.attention.layer import Attention
+
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is None:
+            return
+        if self.page_registry is None:
+            raise RuntimeError("Diffusion KV page data plane requires a Worker registry")
+        installed_layers: set[str] = set()
+        for layer_name, module in pipeline.named_modules():
+            if not isinstance(module, Attention) or module.paged_kv_cache_role is None:
+                continue
+            module.paged_kv_cache = self.page_registry.get_layer_cache(layer_name)
+            installed_layers.add(layer_name)
+        expected_layers = set(self.get_kv_cache_spec())
+        if installed_layers != expected_layers:
+            raise RuntimeError(
+                "Diffusion KV physical cache installation mismatch: "
+                f"expected={sorted(expected_layers)}, installed={sorted(installed_layers)}"
+            )
+
+    def _clear_paged_kv_caches(self) -> None:
+        from vllm_omni.diffusion.attention.layer import Attention
+
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is None:
+            return
+        for _, module in pipeline.named_modules():
+            if isinstance(module, Attention):
+                module.paged_kv_cache = None
 
     def install_diffusion_kv_metadata(
         self,
@@ -566,6 +598,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if self.page_transfer_manager is not None:
             self.page_transfer_manager.close()
         self.release_diffusion_kv_requests(set(self._diffusion_page_bindings))
+        self._clear_paged_kv_caches()
         self.page_transfer_manager = None
         self.page_registry = None
 

@@ -405,6 +405,40 @@ def test_set_kv_cache_config_initializes_registry_only_in_paged_mode(monkeypatch
     assert runner.page_transfer_manager is transfer_manager
 
 
+def test_set_kv_cache_config_installs_registry_storage_on_attention_modules(
+    monkeypatch,
+) -> None:
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    attention = object.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    attention.paged_kv_cache_role = "primary"
+    attention.paged_kv_cache = None
+    runner.pipeline = SimpleNamespace(
+        named_modules=lambda: [("layer0", attention)],
+    )
+    layer_spec = object()
+    layer_cache = torch.zeros(2, 4, 4, 2, 8)
+    runner.get_kv_cache_spec = Mock(return_value={"layer0": layer_spec})
+    registry = SimpleNamespace(get_layer_cache=Mock(return_value=layer_cache))
+    monkeypatch.setattr(
+        model_runner_module,
+        "WorkerPageRegistry",
+        Mock(return_value=registry),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "PageTransferSessionManager",
+        Mock(return_value=object()),
+    )
+
+    runner.set_kv_cache_config(make_kv_cache_config())
+
+    registry.get_layer_cache.assert_called_once_with("layer0")
+    assert attention.paged_kv_cache is layer_cache
+
+
 def test_dense_mode_rejects_page_data_plane_initialization(monkeypatch) -> None:
     runner = make_runner(DiffusionKVCacheMode.DENSE_LEGACY)
     registry_cls = Mock()

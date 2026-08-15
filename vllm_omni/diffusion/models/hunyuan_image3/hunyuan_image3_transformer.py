@@ -4,7 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, cast
 
@@ -61,6 +61,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.page import (
+    DiffusionPageBinding,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
     get_cfg_group,
@@ -75,15 +79,37 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.hunyuan_image3.paged_kv import (
+    build_hunyuan_paged_kv_batch,
+    gather_hunyuan_kv_reference,
+    write_hunyuan_kv,
+)
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+
+
+class _ImmediatePageWriteEvent:
+    def query(self) -> bool:
+        return True
+
+
+def _record_page_write_event(layer_cache: torch.Tensor) -> object:
+    if layer_cache.device.type != "cuda":
+        return _ImmediatePageWriteEvent()
+    event = torch.cuda.Event()
+    torch.cuda.current_stream(layer_cache.device).record_event(event)
+    return event
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -1100,6 +1126,136 @@ class ImageKVCacheManager(nn.Module):
         )
         return key, value
 
+    @staticmethod
+    def _get_cache_mode() -> DiffusionKVCacheMode:
+        if not is_forward_context_available():
+            return DiffusionKVCacheMode.DENSE_LEGACY
+        config = get_forward_context().omni_diffusion_config
+        return getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+
+    @staticmethod
+    def _row_binding(
+        binding: DiffusionPageBinding,
+        branch: int,
+    ) -> DiffusionPageBinding:
+        if branch < 0 or branch >= len(binding.sequences):
+            raise ValueError(
+                f"Hunyuan paged KV branch {branch} is out of range for "
+                f"request {binding.request_id!r} with {len(binding.sequences)} sequences"
+            )
+        sequence = replace(binding.sequences[branch], sequence_id=0)
+        return DiffusionPageBinding(
+            request_id=binding.request_id,
+            allocation_generation=binding.allocation_generation,
+            sequences=(sequence,),
+            page_states=binding.page_states,
+            externally_required=binding.externally_required,
+        )
+
+    def _forward_paged(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.sp_size > 1:
+            raise ValueError("Hunyuan paged_scheduler reference attention does not support sequence parallelism")
+        if kwargs.get("uncond_cfg_prefill", False):
+            raise ValueError("Hunyuan paged_scheduler does not use dense uncond CFG KV prefill")
+        if self._injected_ar_kv is not None:
+            raise ValueError("Hunyuan paged_scheduler must import AR KV through committed Worker pages")
+        if attention_mask is None:
+            raise ValueError("Hunyuan paged_scheduler requires an attention mask")
+
+        context = get_forward_context()
+        page_bindings = context.diffusion_page_bindings
+        if not page_bindings:
+            raise ValueError("Hunyuan paged_scheduler requires live Worker page bindings")
+        request_ids = kwargs.get("request_ids")
+        row_branches = kwargs.get("row_branches")
+        query_lens = kwargs.get("query_lens")
+        seq_lens = kwargs.get("seq_lens")
+        if request_ids is None or row_branches is None:
+            raise ValueError("Hunyuan paged_scheduler requires request_ids and row_branches")
+        row_count = len(query_lens)
+        if len(seq_lens) != row_count or len(request_ids) != row_count or len(row_branches) != row_count:
+            raise ValueError(
+                "Hunyuan paged_scheduler row metadata mismatch: "
+                f"query_lens={len(query_lens)}, seq_lens={len(seq_lens)}, "
+                f"request_ids={len(request_ids)}, row_branches={len(row_branches)}"
+            )
+        if len(set(query_lens)) != 1:
+            raise ValueError(f"Hunyuan paged_scheduler requires uniform query lengths, got {query_lens}")
+
+        query_len = query_lens[0]
+        head_num_per_rank = query.shape[1]
+        kv_head_num_per_rank = key.shape[1]
+        head_dim = query.shape[2]
+        if query.shape[0] != row_count * query_len:
+            raise ValueError(
+                f"Hunyuan paged query geometry mismatch: rows={row_count}, "
+                f"query_len={query_len}, flattened={query.shape[0]}"
+            )
+        query = query.reshape(row_count, query_len, head_num_per_rank, head_dim)
+        key = key.reshape(row_count, query_len, kv_head_num_per_rank, head_dim)
+        value = value.reshape(row_count, query_len, kv_head_num_per_rank, head_dim)
+
+        layer_cache = self.attn.paged_kv_cache
+        if layer_cache is None:
+            raise RuntimeError("Hunyuan paged_scheduler attention layer has no installed Worker page storage")
+        block_size = layer_cache.shape[2]
+        position_ids = kwargs.get("position_ids")
+        first_step = bool(kwargs.get("first_step"))
+        gathered_keys: list[torch.Tensor] = []
+        gathered_values: list[torch.Tensor] = []
+        for row_index, (request_id, branch) in enumerate(zip(request_ids, row_branches)):
+            try:
+                binding = page_bindings[request_id]
+            except KeyError as exc:
+                raise ValueError(f"Missing Hunyuan Worker page binding for request {request_id!r}") from exc
+            row_binding = self._row_binding(binding, int(branch))
+            row_positions = None if position_ids is None else position_ids[row_index : row_index + 1]
+            batch = build_hunyuan_paged_kv_batch(
+                row_binding,
+                query_lens=[query_lens[row_index]],
+                seq_lens=[seq_lens[row_index]],
+                block_size=block_size,
+                position_ids=row_positions,
+            )
+            write_hunyuan_kv(
+                layer_cache,
+                batch,
+                key[row_index : row_index + 1],
+                value[row_index : row_index + 1],
+                stable_already_committed=not first_step,
+            )
+            if first_step:
+                locally_produced = set(batch.cacheable_block_ids[0]).difference(binding.externally_required)
+                if locally_produced:
+                    binding.record_local_write_completion(
+                        locally_produced,
+                        _record_page_write_event(layer_cache),
+                    )
+            gathered_key, gathered_value = gather_hunyuan_kv_reference(layer_cache, batch)
+            gathered_keys.append(gathered_key)
+            gathered_values.append(gathered_value)
+
+        key = torch.cat(gathered_keys, dim=0)
+        value = torch.cat(gathered_values, dim=0)
+        if self.allgather_size <= 1:
+            repeat_num = head_num_per_rank // kv_head_num_per_rank
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+
+        attn_metadata = AttentionMetadata(
+            attn_mask=attention_mask.contiguous(),
+            full_attn_spans=kwargs.get("full_attn_spans"),
+        )
+        attn_output = self.attn(query, key, value, attn_metadata)
+        return attn_output.reshape(row_count * query_len, head_num_per_rank, head_dim)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -1109,6 +1265,14 @@ class ImageKVCacheManager(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         self.image_token_len = kwargs.get("num_image_tokens")
+        if self._get_cache_mode() is DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return self._forward_paged(
+                query,
+                key,
+                value,
+                attention_mask,
+                **kwargs,
+            )
         first_step = kwargs.get("first_step")
         uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
 

@@ -54,6 +54,8 @@ def _maybe_reshape_attn_mask(
 
 class SDPABackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_paged_kv: bool = True
+    supports_non_causal_paged_kv: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:

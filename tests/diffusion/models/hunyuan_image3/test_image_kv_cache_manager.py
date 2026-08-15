@@ -9,11 +9,22 @@ from __future__ import annotations
 
 import math
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn as nn
+
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.page import (
+    DiffusionPageBinding,
+    DiffusionPageRange,
+    DiffusionSequenceBinding,
+    PageState,
+    build_slot_mapping,
+)
+from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,6 +46,7 @@ SCALING = 1.0 / math.sqrt(HEAD_DIM)
 class MockAttention(nn.Module):
     def __init__(self, num_heads, head_size, causal=False, softmax_scale=None, num_kv_heads=None, **kwargs):
         super().__init__()
+        self.paged_kv_cache = None
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         return query
@@ -99,22 +111,73 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    mode=DiffusionKVCacheMode.DENSE_LEGACY,
+    page_bindings=None,
+    request_ids=None,
+    row_branches=None,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
-    mgr(
-        query,
-        key_flat,
-        value_flat,
-        attn_mask,
-        query_lens=[q_len] * bs,
-        seq_lens=[seq_len] * bs,
-        first_step=first_step,
-        uncond_cfg_prefill=uncond_cfg_prefill,
-        num_image_tokens=num_image_tokens,
-        shard_image_size=shard_image_size,
-        gen_timestep_scatter_index=gen_timestep_scatter_index,
-        position_ids=position_ids,
+    forward_context = ForwardContext(
+        omni_diffusion_config=SimpleNamespace(diffusion_kv_mode=mode),
+        diffusion_page_bindings=page_bindings,
+    )
+    with override_forward_context(forward_context):
+        mgr(
+            query,
+            key_flat,
+            value_flat,
+            attn_mask,
+            query_lens=[q_len] * bs,
+            seq_lens=[seq_len] * bs,
+            first_step=first_step,
+            uncond_cfg_prefill=uncond_cfg_prefill,
+            num_image_tokens=num_image_tokens,
+            shard_image_size=shard_image_size,
+            gen_timestep_scatter_index=gen_timestep_scatter_index,
+            position_ids=position_ids,
+            request_ids=request_ids,
+            row_branches=row_branches,
+        )
+
+
+def _paged_binding() -> DiffusionPageBinding:
+    block_size = 4
+    return DiffusionPageBinding(
+        request_id="req",
+        allocation_generation=7,
+        sequences=(
+            DiffusionSequenceBinding(
+                sequence_id=0,
+                seq_len=8,
+                stable=DiffusionPageRange(
+                    cache_role="primary",
+                    token_start=0,
+                    token_count=4,
+                    block_ids=(1,),
+                    mutable=False,
+                ),
+                dynamic=DiffusionPageRange(
+                    cache_role="primary",
+                    token_start=4,
+                    token_count=4,
+                    block_ids=(2,),
+                    mutable=True,
+                ),
+                slot_mapping=build_slot_mapping(
+                    block_ids=(1, 2),
+                    block_size=block_size,
+                    token_start=0,
+                    token_count=8,
+                    device=torch.device("cpu"),
+                ),
+            ),
+        ),
+        page_states={
+            1: PageState.RESERVED,
+            2: PageState.RESERVED,
+        },
+        externally_required=frozenset(),
     )
 
 
@@ -124,6 +187,50 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_paged_first_step_does_not_allocate_image_kv_cache_map() -> None:
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_cache = torch.zeros(2, 4, 4, NUM_KV_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(8, base=1.0)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=8,
+        seq_len=8,
+        key_flat=key,
+        value_flat=value,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(1, 4),
+        mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        page_bindings={"req": _paged_binding()},
+        request_ids=["req"],
+        row_branches=[0],
+    )
+
+    assert mgr.image_kv_cache_map is None
+    assert mgr.image_kv_cache_lens is None
+    assert mgr._injected_ar_kv is None
+
+
+def test_dense_first_step_still_populates_image_kv_cache_map() -> None:
+    mgr = _make_cache_mgr()
+    key, value = _make_known_kv(8, base=1.0)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=8,
+        seq_len=8,
+        key_flat=key,
+        value_flat=value,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(1, 4),
+    )
+
+    assert mgr.image_kv_cache_map is not None
+    assert mgr.image_kv_cache_lens is not None
 
 
 # ============================================================

@@ -16,7 +16,8 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.data import (
     build_attention_config,
     parse_attention_config,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -419,6 +421,65 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
+    def test_sdpa_declares_non_causal_paged_kv_capability(self):
+        assert AttentionBackend.supports_paged_kv is False
+        assert AttentionBackend.supports_non_causal_paged_kv is False
+        assert SDPABackend.supports_paged_kv is True
+        assert SDPABackend.supports_non_causal_paged_kv is True
+
+    def test_paged_non_causal_attention_rejects_backend_without_capability(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _FakeBackend:
+            supports_paged_kv = False
+            supports_non_causal_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "FAKE_BACKEND"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        monkeypatch.setattr(
+            layer_mod,
+            "get_attn_backend_for_role",
+            lambda **kwargs: (_FakeBackend, AttentionSpec(backend="FLASH_ATTN")),
+        )
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+
+        od_config = SimpleNamespace(
+            model_class_name="HunyuanImage3Pipeline",
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN")),
+            parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with (
+            set_current_diffusion_config(od_config),
+            pytest.raises(
+                ValueError,
+                match="HunyuanImage3Pipeline.*FAKE_BACKEND.*supports_paged_kv",
+            ),
+        ):
+            Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:
             def __init__(self, **kwargs):

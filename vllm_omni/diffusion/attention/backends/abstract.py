@@ -15,6 +15,8 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    supports_paged_kv: bool = False
+    supports_non_causal_paged_kv: bool = False
     # The backend can represent a contiguous valid K/V prefix by slicing the
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.

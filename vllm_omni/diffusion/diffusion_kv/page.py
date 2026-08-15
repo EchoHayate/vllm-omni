@@ -86,6 +86,8 @@ class DiffusionPageBinding:
     sequences: tuple[DiffusionSequenceBinding, ...]
     page_states: dict[int, PageState] = field(default_factory=dict)
     externally_required: frozenset[int] = frozenset()
+    locally_produced_pages: frozenset[int] = frozenset()
+    local_write_event: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -95,6 +97,20 @@ class DiffusionPageBinding:
         missing = self.externally_required.difference(self.page_states)
         if missing:
             raise ValueError(f"externally required pages lack state: {sorted(missing)}")
+
+    def record_local_write_completion(
+        self,
+        block_ids: set[int],
+        event: object,
+    ) -> None:
+        unknown = block_ids.difference(self.page_states)
+        if unknown:
+            raise ValueError(f"locally produced pages lack state: {sorted(unknown)}")
+        imported = block_ids.intersection(self.externally_required)
+        if imported:
+            raise ValueError(f"externally required pages cannot be locally produced: {sorted(imported)}")
+        self.locally_produced_pages = self.locally_produced_pages.union(block_ids)
+        self.local_write_event = event
 
     @property
     def is_compute_ready(self) -> bool:

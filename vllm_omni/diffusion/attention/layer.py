@@ -23,6 +23,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
@@ -77,6 +78,7 @@ class Attention(nn.Module):
             raise ValueError("paged_kv_cache_role must be non-empty when provided")
         self.paged_kv_cache_role = paged_kv_cache_role
         self.paged_kv_cache_dtype = paged_kv_cache_dtype
+        self.paged_kv_cache: torch.Tensor | None = None
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
@@ -117,6 +119,24 @@ class Attention(nn.Module):
             logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
             logger.debug("Attention(role=%s) → platform default", role)
+
+        cache_mode = getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        if paged_kv_cache_role is not None and cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
+            model_name = getattr(config, "model_class_name", None) or "<unknown diffusion model>"
+            backend_name = attn_backend_cls.get_name()
+            required_capabilities = ["supports_paged_kv"]
+            if not causal:
+                required_capabilities.append("supports_non_causal_paged_kv")
+            missing_capabilities = [
+                capability for capability in required_capabilities if not getattr(attn_backend_cls, capability, False)
+            ]
+            if missing_capabilities:
+                raise ValueError(
+                    f"{model_name} selected attention backend {backend_name!r} for "
+                    f"paged_scheduler role {paged_kv_cache_role!r}, but the backend lacks required capability "
+                    f"{', '.join(missing_capabilities)}. Select TORCH_SDPA or a backend that explicitly "
+                    "implements page-native non-causal KV."
+                )
 
         self.attn_backend = attn_backend_cls
         self.attn_impl_cls = self.attn_backend.get_impl_cls()
