@@ -39,11 +39,23 @@ def _attention(*, enabled: bool) -> Attention:
 
 def _runner(attention: Attention) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config = SimpleNamespace(
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        diffusion_page_transfer_timeout_s=30.0,
+    )
     runner.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=4),
         model_config=SimpleNamespace(dtype=torch.float16),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=1,
+            max_model_len=32,
+        ),
     )
+    runner.device = torch.device("cpu")
+    runner.kv_cache_config = None
+    runner.page_registry = None
+    runner.page_transfer_manager = None
+    runner._diffusion_page_bindings = {}
     pipeline = nn.Module()
     pipeline.image_attention = attention
     runner.pipeline = pipeline

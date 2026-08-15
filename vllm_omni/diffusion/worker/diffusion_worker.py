@@ -860,6 +860,13 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         if self.model_runner is not None:
+            shutdown_page_data_plane = getattr(
+                self.model_runner,
+                "shutdown_kv_cache_data_plane",
+                None,
+            )
+            if shutdown_page_data_plane is not None:
+                shutdown_page_data_plane()
             mgr = getattr(self.model_runner, "kv_transfer_manager", None)
             if mgr is not None:
                 mgr.shutdown_prefetch()

@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.worker.diffusion_worker as worker_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import (
@@ -13,6 +16,7 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVSequenceMetadata,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -42,18 +46,62 @@ def make_metadata(request_id: str = "req-0") -> DiffusionKVMetadata:
 
 def make_runner(mode: DiffusionKVCacheMode) -> DiffusionModelRunner:
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(diffusion_kv_mode=mode)
+    runner.od_config = SimpleNamespace(
+        diffusion_kv_mode=mode,
+        diffusion_page_transfer_timeout_s=17.0,
+    )
+    runner.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_model_len=32,
+        )
+    )
+    runner.device = torch.device("cpu")
+    runner.kv_cache_config = None
+    runner.page_registry = None
+    runner.page_transfer_manager = None
+    runner._diffusion_page_bindings = {}
     return runner
 
 
-def make_scheduler_output(*new_reqs: NewRequestData) -> DiffusionSchedulerOutput:
+def make_scheduler_output(
+    *new_reqs: NewRequestData,
+    cached: tuple[str, ...] = (),
+    finished: set[str] | None = None,
+) -> DiffusionSchedulerOutput:
     return DiffusionSchedulerOutput(
         step_id=0,
         scheduled_new_reqs=list(new_reqs),
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        finished_req_ids=set(),
-        num_running_reqs=len(new_reqs),
+        scheduled_cached_reqs=CachedRequestData(request_ids=list(cached)),
+        finished_req_ids=finished or set(),
+        num_running_reqs=len(new_reqs) + len(cached),
         num_waiting_reqs=0,
+    )
+
+
+def make_new_request(
+    request_id: str,
+    *,
+    generation: int = 1,
+) -> NewRequestData:
+    return NewRequestData(
+        request_id=request_id,
+        req=SimpleNamespace(request_id=request_id),
+        diffusion_kv_metadata=DiffusionKVMetadata(
+            request_id=request_id,
+            allocation_generation=generation,
+            sequences=(),
+        ),
+    )
+
+
+def make_kv_cache_config():
+    return SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=["layer0"],
+            )
+        ]
     )
 
 
@@ -323,3 +371,318 @@ def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch)
         )
     ]
     assert result["dp_rank"] == 1
+
+
+def test_set_kv_cache_config_initializes_registry_only_in_paged_mode(monkeypatch) -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.get_kv_cache_spec = Mock(return_value={"layer0": object()})
+    registry = object()
+    transfer_manager = object()
+    registry_cls = Mock(return_value=registry)
+    transfer_manager_cls = Mock(return_value=transfer_manager)
+    monkeypatch.setattr(model_runner_module, "WorkerPageRegistry", registry_cls)
+    monkeypatch.setattr(
+        model_runner_module,
+        "PageTransferSessionManager",
+        transfer_manager_cls,
+    )
+    config = make_kv_cache_config()
+
+    runner.set_kv_cache_config(config)
+
+    registry_cls.assert_called_once_with(
+        kv_cache_config=config,
+        layer_specs={"layer0": runner.get_kv_cache_spec.return_value["layer0"]},
+        device=torch.device("cpu"),
+        max_num_reqs=4,
+        max_model_len=32,
+    )
+    transfer_manager_cls.assert_called_once_with(
+        registry=registry,
+        timeout_s=17.0,
+    )
+    assert runner.page_registry is registry
+    assert runner.page_transfer_manager is transfer_manager
+
+
+def test_dense_mode_rejects_page_data_plane_initialization(monkeypatch) -> None:
+    runner = make_runner(DiffusionKVCacheMode.DENSE_LEGACY)
+    registry_cls = Mock()
+    monkeypatch.setattr(model_runner_module, "WorkerPageRegistry", registry_cls)
+
+    with pytest.raises(ValueError, match="dense_legacy.*KVCacheConfig"):
+        runner.set_kv_cache_config(make_kv_cache_config())
+
+    assert runner.page_registry is None
+    assert runner.page_transfer_manager is None
+    registry_cls.assert_not_called()
+
+
+def test_runner_construction_does_not_initialize_page_registry_before_cache_sizing(
+    monkeypatch,
+) -> None:
+    legacy_manager = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_kv_async_prefetch=False,
+            need_recv_cache=False,
+        )
+    )
+    monkeypatch.setattr(
+        model_runner_module.OmniKVTransferManager,
+        "from_od_config",
+        Mock(return_value=legacy_manager),
+    )
+    od_config = SimpleNamespace(
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        cfg_kv_collect_func=None,
+    )
+
+    runner = DiffusionModelRunner(
+        SimpleNamespace(),
+        od_config,
+        torch.device("cpu"),
+    )
+    runner._execute_request_list = Mock(return_value=object())
+    synchronize = Mock()
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "synchronize",
+        synchronize,
+    )
+
+    runner.profile_run(SimpleNamespace())
+
+    assert runner.kv_cache_config is None
+    assert runner.page_registry is None
+    assert runner.page_transfer_manager is None
+    assert runner._diffusion_page_bindings == {}
+    runner._execute_request_list.assert_called_once()
+    synchronize.assert_called_once()
+
+
+def test_finished_ids_release_before_rebinding_reused_block_ids() -> None:
+    calls: list[tuple] = []
+
+    class Registry:
+        def release_request(self, request_id, allocation_generation):
+            calls.append(("release", request_id, allocation_generation))
+
+        def bind_request(self, metadata):
+            calls.append(("bind", metadata.request_id, metadata.allocation_generation))
+            return SimpleNamespace(
+                request_id=metadata.request_id,
+                allocation_generation=metadata.allocation_generation,
+            )
+
+    class TransferManager:
+        def register_binding(self, binding):
+            calls.append(("register", binding.request_id, binding.allocation_generation))
+
+        def unregister_binding(self, request_id, allocation_generation):
+            calls.append(("unregister", request_id, allocation_generation))
+
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = Registry()
+    runner.page_transfer_manager = TransferManager()
+    runner._diffusion_page_bindings["old"] = SimpleNamespace(
+        request_id="old",
+        allocation_generation=3,
+    )
+
+    bindings = runner._prepare_diffusion_page_bindings(
+        make_scheduler_output(
+            make_new_request("new", generation=4),
+            finished={"old"},
+        )
+    )
+
+    assert calls.index(("release", "old", 3)) < calls.index(("bind", "new", 4))
+    assert tuple(bindings) == ("new",)
+
+
+def test_cached_step_reuses_the_original_page_binding() -> None:
+    binding = SimpleNamespace(request_id="req", allocation_generation=7)
+    registry = SimpleNamespace(bind_request=Mock(return_value=binding))
+    transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+        unregister_binding=Mock(),
+    )
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = registry
+    runner.page_transfer_manager = transfer_manager
+
+    first = runner._prepare_diffusion_page_bindings(make_scheduler_output(make_new_request("req", generation=7)))
+    cached = runner._prepare_diffusion_page_bindings(make_scheduler_output(cached=("req",)))
+
+    assert cached["req"] is first["req"]
+    registry.bind_request.assert_called_once()
+
+
+def test_duplicate_new_request_preserves_existing_page_binding() -> None:
+    binding = SimpleNamespace(request_id="req", allocation_generation=7)
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = SimpleNamespace(
+        bind_request=Mock(),
+        release_request=Mock(),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+        unregister_binding=Mock(),
+    )
+    runner._diffusion_page_bindings["req"] = binding
+
+    with pytest.raises(ValueError, match="duplicate new-request page binding"):
+        runner._prepare_diffusion_page_bindings(make_scheduler_output(make_new_request("req", generation=7)))
+
+    assert runner._diffusion_page_bindings == {"req": binding}
+    runner.page_registry.bind_request.assert_not_called()
+    runner.page_registry.release_request.assert_not_called()
+    runner.page_transfer_manager.unregister_binding.assert_not_called()
+
+
+def test_step_preflight_failure_does_not_install_page_binding() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.pipeline = object()
+    runner._supports_step_mode = Mock(return_value=False)
+    runner.page_registry = SimpleNamespace(bind_request=Mock())
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+        unregister_binding=Mock(),
+    )
+
+    with pytest.raises(ValueError, match="does not support step execution"):
+        runner.execute_stepwise(make_scheduler_output(make_new_request("req", generation=7)))
+
+    runner.page_registry.bind_request.assert_not_called()
+    assert runner._diffusion_page_bindings == {}
+
+
+def test_step_setup_failure_releases_new_page_binding() -> None:
+    binding = SimpleNamespace(request_id="req", allocation_generation=7)
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config.cache_backend = "none"
+    runner.od_config.parallel_config = SimpleNamespace(use_hsdp=False)
+    runner.pipeline = object()
+    runner.state_cache = {}
+    runner._supports_step_mode = Mock(return_value=True)
+    runner._update_states = Mock(side_effect=RuntimeError("step setup failed"))
+    runner.page_registry = SimpleNamespace(
+        bind_request=Mock(return_value=binding),
+        release_request=Mock(),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+        unregister_binding=Mock(),
+    )
+
+    with pytest.raises(RuntimeError, match="step setup failed"):
+        runner.execute_stepwise(make_scheduler_output(make_new_request("req", generation=7)))
+
+    runner.page_transfer_manager.unregister_binding.assert_called_once_with("req", 7)
+    runner.page_registry.release_request.assert_called_once_with("req", 7)
+    assert runner._diffusion_page_bindings == {}
+
+
+def test_binding_generation_mismatch_fails_before_forward() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = SimpleNamespace(
+        bind_request=Mock(
+            return_value=SimpleNamespace(
+                request_id="req",
+                allocation_generation=8,
+            )
+        ),
+        release_request=Mock(),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+        unregister_binding=Mock(),
+    )
+
+    with pytest.raises(ValueError, match="binding generation mismatch"):
+        runner.install_diffusion_kv_metadata(
+            "req",
+            make_new_request("req", generation=7).diffusion_kv_metadata,
+        )
+
+    runner.page_registry.release_request.assert_called_once_with("req", 8)
+    runner.page_transfer_manager.register_binding.assert_not_called()
+
+
+def test_independent_tp_ranks_install_the_same_binding_identity() -> None:
+    identities = []
+    for _ in range(2):
+        runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+        runner.page_registry = SimpleNamespace(
+            bind_request=lambda metadata: SimpleNamespace(
+                request_id=metadata.request_id,
+                allocation_generation=metadata.allocation_generation,
+            )
+        )
+        runner.page_transfer_manager = SimpleNamespace(register_binding=lambda binding: None)
+        binding = runner.install_diffusion_kv_metadata(
+            "req",
+            make_new_request("req", generation=11).diffusion_kv_metadata,
+        )
+        identities.append((binding.request_id, binding.allocation_generation))
+
+    assert identities == [("req", 11), ("req", 11)]
+
+
+def test_shutdown_cancels_transfer_sessions_before_releasing_pages() -> None:
+    calls: list[tuple] = []
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_transfer_manager = SimpleNamespace(
+        close=lambda: calls.append(("transfer-close",)),
+        unregister_binding=lambda request_id, generation: calls.append(("unregister", request_id, generation)),
+    )
+    runner.page_registry = SimpleNamespace(
+        release_request=lambda request_id, generation: calls.append(("release", request_id, generation))
+    )
+    runner._diffusion_page_bindings["req"] = SimpleNamespace(
+        request_id="req",
+        allocation_generation=5,
+    )
+
+    runner.shutdown_kv_cache_data_plane()
+
+    assert calls == [
+        ("transfer-close",),
+        ("unregister", "req", 5),
+        ("release", "req", 5),
+    ]
+    assert runner.page_transfer_manager is None
+    assert runner.page_registry is None
+
+
+def test_worker_shutdown_closes_page_data_plane_before_legacy_prefetch(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = SimpleNamespace(
+        shutdown_kv_cache_data_plane=lambda: calls.append("page-data-plane"),
+        kv_transfer_manager=SimpleNamespace(
+            shutdown_prefetch=lambda: calls.append("legacy-prefetch"),
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "destroy_distributed_env",
+        lambda: calls.append("distributed-env"),
+    )
+
+    worker.shutdown()
+
+    assert calls == [
+        "page-data-plane",
+        "legacy-prefetch",
+        "distributed-env",
+    ]
+
+
+def test_forward_context_exposes_diffusion_page_bindings() -> None:
+    binding = object()
+
+    with set_forward_context(diffusion_page_bindings={"req": binding}):
+        assert get_forward_context().diffusion_page_bindings == {"req": binding}

@@ -14,7 +14,7 @@ import copy
 import gc
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -34,6 +34,9 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageBinding
+from vllm_omni.diffusion.diffusion_kv.transfer import PageTransferSessionManager
+from vllm_omni.diffusion.diffusion_kv.worker_registry import WorkerPageRegistry
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -148,6 +151,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # and BlockTable binding remain the responsibility of the paged
         # data-plane initialization path.
         self.kv_cache_config: KVCacheConfig | None = None
+        self.page_registry: WorkerPageRegistry | None = None
+        self.page_transfer_manager: PageTransferSessionManager | None = None
+        self._diffusion_page_bindings: dict[str, DiffusionPageBinding] = {}
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
@@ -406,16 +412,173 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Retain the Engine-generated rank-local config for the data plane."""
 
+        cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(f"{cache_mode.value} mode must not receive a Diffusion KVCacheConfig")
+
         configured_layers = {
             layer_name for group in kv_cache_config.kv_cache_groups for layer_name in group.layer_names
         }
-        expected_layers = set(self.get_kv_cache_spec())
+        layer_specs = self.get_kv_cache_spec()
+        expected_layers = set(layer_specs)
         if configured_layers != expected_layers:
             raise ValueError(
                 "Rank-local Diffusion KVCacheConfig layer mismatch: "
                 f"expected={sorted(expected_layers)}, configured={sorted(configured_layers)}"
             )
         self.kv_cache_config = kv_cache_config
+        self.initialize_kv_cache_data_plane(
+            kv_cache_config=kv_cache_config,
+            layer_specs=layer_specs,
+        )
+
+    def initialize_kv_cache_data_plane(
+        self,
+        *,
+        kv_cache_config: KVCacheConfig,
+        layer_specs: dict[str, KVCacheSpec],
+    ) -> None:
+        if self.page_registry is not None or self.page_transfer_manager is not None:
+            raise RuntimeError("Diffusion KV page data plane is already initialized")
+        scheduler_config = self.vllm_config.scheduler_config
+        self.page_registry = WorkerPageRegistry(
+            kv_cache_config=kv_cache_config,
+            layer_specs=layer_specs,
+            device=self.device,
+            max_num_reqs=scheduler_config.max_num_seqs,
+            max_model_len=scheduler_config.max_model_len,
+        )
+        self.page_transfer_manager = PageTransferSessionManager(
+            registry=self.page_registry,
+            timeout_s=getattr(self.od_config, "diffusion_page_transfer_timeout_s", 30.0),
+        )
+
+    def install_diffusion_kv_metadata(
+        self,
+        request_id: str,
+        metadata: DiffusionKVMetadata,
+    ) -> DiffusionPageBinding:
+        self._validate_diffusion_kv_metadata(
+            request_id=request_id,
+            metadata=metadata,
+        )
+        if self.page_registry is None or self.page_transfer_manager is None:
+            raise RuntimeError("Diffusion KV page data plane is not initialized")
+
+        existing = self._diffusion_page_bindings.get(request_id)
+        if existing is not None:
+            if existing.allocation_generation != metadata.allocation_generation:
+                raise ValueError(
+                    "Diffusion KV metadata generation mismatch: "
+                    f"request={request_id!r}, active={existing.allocation_generation}, "
+                    f"metadata={metadata.allocation_generation}"
+                )
+            return existing
+
+        binding = self.page_registry.bind_request(metadata)
+        if binding.request_id != request_id:
+            self.page_registry.release_request(
+                binding.request_id,
+                binding.allocation_generation,
+            )
+            raise ValueError(
+                f"Diffusion KV binding request mismatch: expected={request_id!r}, got={binding.request_id!r}"
+            )
+        if binding.allocation_generation != metadata.allocation_generation:
+            self.page_registry.release_request(
+                binding.request_id,
+                binding.allocation_generation,
+            )
+            raise ValueError(
+                "Diffusion KV binding generation mismatch: "
+                f"request={request_id!r}, expected={metadata.allocation_generation}, "
+                f"got={binding.allocation_generation}"
+            )
+        try:
+            self.page_transfer_manager.register_binding(binding)
+        except Exception:
+            self.page_registry.release_request(
+                binding.request_id,
+                binding.allocation_generation,
+            )
+            raise
+        self._diffusion_page_bindings[request_id] = binding
+        return binding
+
+    def release_diffusion_kv_requests(self, request_ids: set[str]) -> None:
+        if not request_ids:
+            return
+        if self.page_registry is None or self.page_transfer_manager is None:
+            if self._diffusion_page_bindings:
+                raise RuntimeError("Diffusion KV bindings exist without an initialized data plane")
+            return
+        for request_id in request_ids:
+            binding = self._diffusion_page_bindings.pop(request_id, None)
+            if binding is None:
+                continue
+            self.page_transfer_manager.unregister_binding(
+                request_id,
+                binding.allocation_generation,
+            )
+            self.page_registry.release_request(
+                request_id,
+                binding.allocation_generation,
+            )
+
+    def _prepare_diffusion_page_bindings(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ) -> dict[str, DiffusionPageBinding]:
+        cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return {}
+
+        self.release_diffusion_kv_requests(scheduler_output.finished_req_ids)
+        newly_installed: set[str] = set()
+        try:
+            for new_req in scheduler_output.scheduled_new_reqs:
+                validate_new_request_data_identity(new_req)
+                if new_req.request_id in self._diffusion_page_bindings:
+                    raise ValueError(
+                        f"Received duplicate new-request page binding for cached request {new_req.request_id!r}"
+                    )
+                metadata = new_req.diffusion_kv_metadata
+                self._validate_diffusion_kv_metadata(
+                    request_id=new_req.request_id,
+                    metadata=metadata,
+                )
+                assert metadata is not None
+                self.install_diffusion_kv_metadata(new_req.request_id, metadata)
+                newly_installed.add(new_req.request_id)
+
+            bindings: dict[str, DiffusionPageBinding] = {}
+            for request_id in scheduler_output.scheduled_request_ids:
+                binding = self._diffusion_page_bindings.get(request_id)
+                if binding is None:
+                    raise ValueError(f"Missing Diffusion KV page binding for scheduled request {request_id!r}")
+                bindings[request_id] = binding
+            return bindings
+        except Exception:
+            self.release_diffusion_kv_requests(newly_installed)
+            raise
+
+    def shutdown_kv_cache_data_plane(self) -> None:
+        if self.page_transfer_manager is not None:
+            self.page_transfer_manager.close()
+        self.release_diffusion_kv_requests(set(self._diffusion_page_bindings))
+        self.page_transfer_manager = None
+        self.page_registry = None
+
+    @contextmanager
+    def _release_new_page_bindings_on_error(
+        self,
+        request_ids: set[str],
+    ):
+        try:
+            yield
+        except Exception:
+            self.release_diffusion_kv_requests(request_ids)
+            raise
 
     def clear_prompt_embed_cache(self) -> None:
         """Evict all cached text-encoder outputs (e.g. between training epochs).
@@ -566,6 +729,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         record_name: str,
         record_output_peak_memory: bool = True,
+        diffusion_page_bindings: dict[str, DiffusionPageBinding] | None = None,
     ) -> BatchRunnerOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not reqs:
@@ -598,7 +762,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=od_config,
+                diffusion_page_bindings=diffusion_page_bindings,
+            ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
@@ -664,14 +832,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             request_id=req.request_id,
             metadata=diffusion_kv_metadata,
         )
-        runner_output = self._execute_request_list(
-            [req],
-            od_config=self.od_config,
-            allow_single_output=True,
-            require_request_batch_support=False,
-            kv_prefetch_job=kv_prefetch_job,
-            record_name="pipeline_forward",
-        )
+        bindings = None
+        if diffusion_kv_metadata is not None:
+            binding = self.install_diffusion_kv_metadata(
+                req.request_id,
+                diffusion_kv_metadata,
+            )
+            bindings = {req.request_id: binding}
+        try:
+            runner_output = self._execute_request_list(
+                [req],
+                od_config=self.od_config,
+                allow_single_output=True,
+                require_request_batch_support=False,
+                kv_prefetch_job=kv_prefetch_job,
+                record_name="pipeline_forward",
+                diffusion_page_bindings=bindings,
+            )
+        finally:
+            if bindings is not None:
+                self.release_diffusion_kv_requests(set(bindings))
         output = runner_output.runner_outputs[0].result
         assert output is not None
         return output
@@ -746,14 +926,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 request_id=new_req.req.request_id,
                 metadata=new_req.diffusion_kv_metadata,
             )
+        page_bindings = self._prepare_diffusion_page_bindings(scheduler_output)
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
-        return self._execute_request_list(
-            reqs,
-            od_config=od_config,
-            allow_single_output=False,
-            require_request_batch_support=True,
-            record_name="pipeline_forward_batch",
-        )
+        try:
+            return self._execute_request_list(
+                reqs,
+                od_config=od_config,
+                allow_single_output=False,
+                require_request_batch_support=True,
+                record_name="pipeline_forward_batch",
+                diffusion_page_bindings=page_bindings,
+            )
+        finally:
+            self.release_diffusion_kv_requests(set(page_bindings))
 
     # ------------------------------------------------------------------
     # Step-wise execution
@@ -883,10 +1068,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # similar features are not supported here yet.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
+        page_bindings = self._prepare_diffusion_page_bindings(scheduler_output)
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
+        new_page_request_ids = {new_req.request_id for new_req in scheduler_output.scheduled_new_reqs}
+        with (
+            grad_context,
+            self._release_new_page_bindings_on_error(new_page_request_ids),
+        ):
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -905,6 +1095,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
+                diffusion_page_bindings=page_bindings,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)
@@ -968,6 +1159,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
+                            self.release_diffusion_kv_requests({req.request_id})
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,
