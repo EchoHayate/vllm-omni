@@ -348,22 +348,34 @@ def build_hunyuan_diffusion_kv_requests(
     assert prefix_positions is not None and real_pos is not None
 
     target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
-    return tuple(
-        DiffusionKVRequest(
-            f"{request.request_id}/diffusion-kv/{sequence_id}",
-            sequence_id=sequence_id,
-            # The generated-image timestep position terminates the reusable
-            # prompt/reference-image prefix for this execution row.
-            prefix_len=int(prefix_row[-1].item()),
-            target_len=target_len,
-            seq_len=int(valid_row[-1].item()),
-            # Prompt and reference-image tokens are already embedded in this
-            # row's primary self-attention sequence. Hunyuan therefore has no
-            # independently projected cross/joint-attention KV context.
-            kv_contexts=(),
+    page_native_info = (request.kv_sender_info or {}).get("page_native") or {}
+    imported_prefix_token_count = int(page_native_info.get("available_prefix_token_count", 0))
+    requests: list[DiffusionKVRequest] = []
+    for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos)):
+        prefix_len = int(prefix_row[-1].item())
+        seq_len = int(valid_row[-1].item())
+        if prefix_len + target_len > seq_len:
+            raise ValueError(
+                "Hunyuan stable prefix and dynamic target exceed valid sequence length: "
+                f"prefix_len={prefix_len}, target_len={target_len}, seq_len={seq_len}"
+            )
+        requests.append(
+            DiffusionKVRequest(
+                f"{request.request_id}/diffusion-kv/{sequence_id}",
+                sequence_id=sequence_id,
+                # The generated-image timestep position terminates the reusable
+                # prompt/reference-image prefix for this execution row.
+                prefix_len=prefix_len,
+                target_len=target_len,
+                seq_len=seq_len,
+                imported_prefix_token_count=imported_prefix_token_count,
+                # Prompt and reference-image tokens are already embedded in this
+                # row's primary self-attention sequence. Hunyuan therefore has no
+                # independently projected cross/joint-attention KV context.
+                kv_contexts=(),
+            )
         )
-        for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos))
-    )
+    return tuple(requests)
 
 
 def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:

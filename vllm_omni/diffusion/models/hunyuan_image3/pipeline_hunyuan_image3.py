@@ -23,7 +23,11 @@ from vllm.transformers_utils.config import get_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -499,6 +503,47 @@ class HunyuanImage3Pipeline(
             mgr._injected_ar_kv = None
         return snapshot if found else None
 
+    def _uses_paged_kv(self) -> bool:
+        return self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+    def _get_live_page_binding(self, request_id: str):
+        if not is_forward_context_available():
+            raise ValueError(
+                f"Hunyuan paged request {request_id!r} requires a live Worker page binding, "
+                "but ForwardContext is unavailable."
+            )
+        page_bindings = get_forward_context().diffusion_page_bindings
+        if not page_bindings or request_id not in page_bindings:
+            raise ValueError(f"Hunyuan paged request {request_id!r} requires a live Worker page binding.")
+        return page_bindings[request_id]
+
+    def _row_prefix_len(
+        self,
+        state: "StepRequestState",
+        branch: int,
+    ) -> int:
+        if self._uses_paged_kv():
+            binding = self._get_live_page_binding(state.request_id)
+            if branch < 0 or branch >= len(binding.sequences):
+                raise ValueError(
+                    f"Hunyuan paged row branch {branch} is out of range for request "
+                    f"{state.request_id!r} with {len(binding.sequences)} sequences."
+                )
+            sequence = binding.sequences[branch]
+            if sequence.sequence_id != branch:
+                raise ValueError(
+                    f"Hunyuan paged CFG row {branch} does not match Scheduler sequence_id "
+                    f"{sequence.sequence_id} for request {state.request_id!r}."
+                )
+            return int(sequence.stable.token_count)
+
+        prompt_kv = state.extra.get(_STEP_PROMPT_KV)
+        if prompt_kv is None:
+            raise ValueError(
+                f"Missing Hunyuan prompt KV cache for request {state.request_id} during later denoise step."
+            )
+        return int(prompt_kv[0]["lens"][branch].item())
+
     def _restore_injected_ar_kv(
         self,
         states: list["StepRequestState"],
@@ -652,16 +697,10 @@ class HunyuanImage3Pipeline(
     ) -> list[int] | None:
         if not states or states[0].step_index == 0:
             return None
-        prefix_lens: list[int] = []
-        for state_idx, branch in zip(row_state_indexes, row_branches):
-            prompt_kv = states[state_idx].extra.get(_STEP_PROMPT_KV)
-            if prompt_kv is None:
-                raise ValueError(
-                    f"Missing Hunyuan prompt KV cache for request {states[state_idx].request_id} "
-                    "during later denoise step."
-                )
-            prefix_lens.append(int(prompt_kv[0]["lens"][branch].item()))
-        return prefix_lens
+        return [
+            self._row_prefix_len(states[state_idx], branch)
+            for state_idx, branch in zip(row_state_indexes, row_branches)
+        ]
 
     def _merge_step_model_inputs(
         self,
@@ -708,6 +747,9 @@ class HunyuanImage3Pipeline(
             b, _, q_len, seq_len = merged["attention_mask"].shape
             merged["query_lens"] = [q_len] * b
             merged["seq_lens"] = [seq_len] * b
+        if self._uses_paged_kv():
+            merged["request_ids"] = [states[state_idx].request_id for state_idx in row_state_indexes]
+            merged["row_branches"] = list(row_branches)
 
         input_values = [states[state_idx].extra.get(_STEP_INPUT_IDS) for state_idx in row_state_indexes]
         if input_values[0] is None:
@@ -1817,8 +1859,9 @@ class HunyuanImage3Pipeline(
             _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
             _STEP_OUTPUT_SIZE: (target_height, target_width),
             _STEP_COT_TEXT_LIST: cot_text_list,
-            _STEP_AR_KV: self._snapshot_injected_ar_kv(),
         }
+        if not self._uses_paged_kv():
+            state.extra[_STEP_AR_KV] = self._snapshot_injected_ar_kv()
         return state
 
     def _step_group_key(self, state: "StepRequestState") -> tuple[Any, ...]:
@@ -1871,8 +1914,7 @@ class HunyuanImage3Pipeline(
         row_branches = [branch for branch in range(cfg_factor) for _ in states]
         return row_state_indexes, row_branches
 
-    @staticmethod
-    def _validate_step_group_states(states: list["StepRequestState"]) -> tuple[bool, int]:
+    def _validate_step_group_states(self, states: list["StepRequestState"]) -> tuple[bool, int]:
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty group.")
 
@@ -1897,7 +1939,20 @@ class HunyuanImage3Pipeline(
                 raise ValueError(f"Missing Hunyuan step model kwargs for request {state.request_id}.")
             if state.latents is None:
                 raise ValueError(f"Missing Hunyuan latents for request {state.request_id}.")
-            if first_step:
+            if self._uses_paged_kv():
+                binding = self._get_live_page_binding(state.request_id)
+                if len(binding.sequences) != cfg_factor:
+                    raise ValueError(
+                        f"Hunyuan paged request {state.request_id!r} has {len(binding.sequences)} "
+                        f"Scheduler sequences for cfg_factor={cfg_factor}."
+                    )
+                for branch, sequence in enumerate(binding.sequences):
+                    if sequence.sequence_id != branch:
+                        raise ValueError(
+                            f"Hunyuan paged CFG row {branch} does not match Scheduler sequence_id "
+                            f"{sequence.sequence_id} for request {state.request_id!r}."
+                        )
+            elif first_step:
                 if _STEP_AR_KV not in state.extra:
                     raise ValueError(f"Missing Hunyuan AR KV snapshot for request {state.request_id}.")
                 if _STEP_INPUT_IDS not in state.extra:
@@ -1921,13 +1976,12 @@ class HunyuanImage3Pipeline(
             ]
             next_kwargs: dict[str, Any] = {}
             for key, value in merged_kwargs.items():
-                if key in {"query_lens", "seq_lens"}:
+                if key in {"query_lens", "request_ids", "row_branches", "seq_lens"}:
                     continue
                 if key == "full_attn_spans":
                     next_kwargs[key] = state.extra[_STEP_MODEL_KWARGS].get(key)
                 elif key == "attention_mask" and isinstance(value, torch.Tensor):
-                    cache = state.extra.get(_STEP_PROMPT_KV)
-                    if cache is None:
+                    if state.step_index == 0:
                         next_kwargs[key] = value[state_rows]
                     else:
                         compact_masks = []
@@ -1935,7 +1989,7 @@ class HunyuanImage3Pipeline(
                             branch = row_branches[row_idx]
                             row_mask = value[row_idx : row_idx + 1]
                             query_len = int(row_mask.shape[-2])
-                            prefix_len = int(cache[0]["lens"][branch].item())
+                            prefix_len = self._row_prefix_len(state, branch)
                             max_prefix_len = int(row_mask.shape[-1]) - query_len
                             prefix_mask = row_mask[:, :, :, :prefix_len]
                             current_mask = row_mask[:, :, :, max_prefix_len : max_prefix_len + query_len]
@@ -1980,10 +2034,11 @@ class HunyuanImage3Pipeline(
             row_branches,
             first_step,
         )
-        if first_step:
-            self._restore_injected_ar_kv(states, row_state_indexes, row_branches)
-        else:
-            self._restore_prompt_kv_cache(states, row_state_indexes, row_branches)
+        if not self._uses_paged_kv():
+            if first_step:
+                self._restore_injected_ar_kv(states, row_state_indexes, row_branches)
+            else:
+                self._restore_prompt_kv_cache(states, row_state_indexes, row_branches)
 
         model_inputs = self.prepare_inputs_for_generation(
             input_ids,
@@ -2003,7 +2058,7 @@ class HunyuanImage3Pipeline(
             set_forward_context_denoise_step_idx(None)
         pred = pred.to(dtype=torch.float32)
 
-        if first_step:
+        if first_step and not self._uses_paged_kv():
             self._capture_prompt_kv_cache(states, row_state_indexes, row_branches)
         if cfg_factor > 1:
             pred_cond, pred_uncond = pred.chunk(2)

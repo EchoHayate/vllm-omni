@@ -9,6 +9,8 @@ import torch
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -29,7 +31,9 @@ from vllm_omni.diffusion.worker.utils import StepRequestState
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _pipeline():
+def _pipeline(
+    mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY,
+):
     pipeline = object.__new__(HunyuanImage3Pipeline)
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
     pipeline.od_config = SimpleNamespace(
@@ -37,9 +41,51 @@ def _pipeline():
         parallel_config=SimpleNamespace(sequence_parallel_size=1, cfg_parallel_size=1),
         cache_backend=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_mode=mode,
     )
     pipeline._pipeline = SimpleNamespace()
     return pipeline
+
+
+def _install_prepare_encode_stubs(
+    pipeline: HunyuanImage3Pipeline,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    monkeypatch.setattr(
+        hy3_module,
+        "retrieve_timesteps",
+        lambda *_args, **_kwargs: (torch.tensor([1.0, 0.5]), 2),
+    )
+    pipeline.scheduler = SimpleNamespace()
+    pipeline.config = SimpleNamespace(
+        vae={"latent_channels": 4},
+        attention_head_dim=2,
+        rope_theta=10000.0,
+    )
+    pipeline.generation_config = SimpleNamespace()
+    pipeline._pipeline = SimpleNamespace(
+        prepare_latents=lambda **_kwargs: torch.zeros(1, 4, 8, 8),
+        _maybe_handle_ar_kv_reuse=lambda input_ids, model_kwargs, **_kwargs: (
+            input_ids,
+            0,
+        ),
+    )
+    pipeline.prepare_model_inputs = lambda **_kwargs: {
+        "input_ids": torch.arange(8).reshape(1, 8),
+        "batch_gen_image_info": [
+            ImageInfo(
+                image_type="gen_image",
+                image_width=512,
+                image_height=512,
+                image_token_length=4,
+            )
+        ],
+        "generator": None,
+    }
+    pipeline._prepare_attention_mask_for_generation = lambda input_ids, generation_config, model_kwargs: torch.zeros(
+        1, 1, 8, 8
+    )
 
 
 def _state(request_id: str, step_index: int) -> StepRequestState:
@@ -62,6 +108,18 @@ def _state(request_id: str, step_index: int) -> StepRequestState:
         },
     }
     return state
+
+
+def _page_binding(*prefix_lens: int):
+    return SimpleNamespace(
+        sequences=tuple(
+            SimpleNamespace(
+                sequence_id=sequence_id,
+                stable=SimpleNamespace(token_count=prefix_len),
+            )
+            for sequence_id, prefix_len in enumerate(prefix_lens)
+        )
+    )
 
 
 def _sampling_params(**extra_args):
@@ -144,6 +202,37 @@ def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):
     assert model_inputs["batch_gen_image_info"] == [prepared.generated_image_info]
     assert rope_kwargs["image_infos"] is prepared.rope_image_info
     torch.testing.assert_close(model_inputs["input_ids"], prepared.tokenizer_output.tokens)
+
+
+def test_paged_prepare_encode_stores_no_dense_ar_kv_snapshot(monkeypatch):
+    pipeline = _pipeline(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    _install_prepare_encode_stubs(pipeline, monkeypatch)
+    pipeline._snapshot_injected_ar_kv = lambda: pytest.fail("paged prepare_encode must not snapshot model-owned AR KV")
+    state = StepRequestState(
+        request_id="req-paged",
+        sampling=_sampling_params(),
+        prompt="prompt",
+    )
+
+    pipeline.prepare_encode(state)
+
+    assert _STEP_AR_KV not in state.extra
+
+
+def test_dense_prepare_encode_preserves_ar_kv_snapshot(monkeypatch):
+    pipeline = _pipeline(DiffusionKVCacheMode.DENSE_LEGACY)
+    _install_prepare_encode_stubs(pipeline, monkeypatch)
+    snapshot = [[(torch.ones(1), torch.ones(1))]]
+    pipeline._snapshot_injected_ar_kv = lambda: snapshot
+    state = StepRequestState(
+        request_id="req-dense",
+        sampling=_sampling_params(),
+        prompt="prompt",
+    )
+
+    pipeline.prepare_encode(state)
+
+    assert state.extra[_STEP_AR_KV] is snapshot
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
@@ -440,3 +529,87 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+def test_paged_first_step_uses_live_binding_without_prompt_kv_snapshot(
+    monkeypatch,
+):
+    pipeline = _pipeline(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("req", 0)
+    state.extra.pop(_STEP_AR_KV)
+    state.latents = torch.zeros(1, 1)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+            "full_attn_spans": [[(0, 2)]],
+        }
+    )
+    pipeline._restore_injected_ar_kv = lambda *_args: pytest.fail("paged first step must not restore dense AR KV")
+    pipeline._capture_prompt_kv_cache = lambda *_args: pytest.fail("paged first step must not capture dense prompt KV")
+    captured: dict[str, object] = {}
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        del input_ids, images, timestep
+        captured.update(model_kwargs)
+        return {}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {
+        "diffusion_prediction": torch.zeros(1, 1),
+    }
+    pipeline._update_model_kwargs_for_generation = lambda model_output, model_kwargs: model_kwargs
+    context = ForwardContext(
+        omni_diffusion_config=pipeline.od_config,
+        diffusion_page_bindings={"req": _page_binding(0)},
+    )
+
+    with override_forward_context(context):
+        pipeline._denoise_step_group([state])
+
+    assert _STEP_PROMPT_KV not in state.extra
+    assert captured["request_ids"] == ["req"]
+    assert captured["row_branches"] == [0]
+
+
+def test_later_paged_step_requires_live_worker_page_binding() -> None:
+    pipeline = _pipeline(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    state = _state("req", 1)
+    state.extra.pop(_STEP_AR_KV)
+
+    with pytest.raises(ValueError, match="live Worker page binding"):
+        pipeline._validate_step_group_states([state])
+
+
+def test_paged_grouped_rows_preserve_request_and_cfg_sequence_order() -> None:
+    pipeline = _pipeline(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    states = [_state("req-0", 1), _state("req-1", 2)]
+    for state in states:
+        state.extra.pop(_STEP_AR_KV)
+        state.extra[_STEP_CFG_FACTOR] = 2
+        state.extra[_STEP_MODEL_KWARGS].update(
+            {
+                "attention_mask": torch.ones(2, 1, 2, 4, dtype=torch.bool),
+                "full_attn_spans": [[(2, 4)], [(2, 4)]],
+            }
+        )
+    row_state_indexes, row_branches = pipeline._step_row_order(states, 2)
+    context = ForwardContext(
+        omni_diffusion_config=pipeline.od_config,
+        diffusion_page_bindings={
+            "req-0": _page_binding(2, 2),
+            "req-1": _page_binding(2, 2),
+        },
+    )
+
+    with override_forward_context(context):
+        _, merged = pipeline._merge_step_model_inputs(
+            states,
+            row_state_indexes,
+            row_branches,
+            first_step=False,
+        )
+
+    assert row_state_indexes == [0, 1, 0, 1]
+    assert merged["request_ids"] == ["req-0", "req-1", "req-0", "req-1"]
+    assert merged["row_branches"] == [0, 0, 1, 1]

@@ -416,6 +416,37 @@ def test_sender_endpoint_does_not_change_local_kv_request() -> None:
     assert kv_requests[0].num_computed_tokens == 0
 
 
+def test_page_native_sender_info_sets_imported_prefix_boundary() -> None:
+    tokenizer, image_processor = _components([12])
+    request = _request(guidance_scale=1.0)
+    request.kv_sender_info = {
+        "host": "127.0.0.1",
+        "page_native": {
+            "available_prefix_token_count": 8,
+            "dense_ar_kv": torch.ones(2),
+        },
+    }
+    prepared_layout = _prepare(request, tokenizer, image_processor)
+
+    kv_requests = build_hunyuan_diffusion_kv_requests(request, prepared_layout)
+
+    assert kv_requests[0].imported_prefix_token_count == 8
+    assert not hasattr(kv_requests[0], "dense_ar_kv")
+
+
+def test_rejects_stable_and_dynamic_geometry_beyond_valid_sequence() -> None:
+    tokenizer, image_processor = _components([20])
+    request = _request(guidance_scale=1.0)
+    prepared_layout = _prepare(request, tokenizer, image_processor)
+    prepared_layout.tokenizer_output.real_pos = torch.tensor([[30]])
+
+    with pytest.raises(
+        ValueError,
+        match="stable prefix and dynamic target exceed valid sequence length",
+    ):
+        build_hunyuan_diffusion_kv_requests(request, prepared_layout)
+
+
 def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch) -> None:
     tokenizer, image_processor = _components([12])
     hf_config = SimpleNamespace(
