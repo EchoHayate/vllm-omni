@@ -185,6 +185,12 @@ class PageTransferSessionManager:
     def unregister_endpoint(self, endpoint: PageEndpoint) -> None:
         self._endpoints.pop(endpoint, None)
 
+    def resolve_endpoint(self, endpoint: PageEndpoint) -> torch.Tensor:
+        try:
+            return self._endpoints[endpoint]
+        except KeyError as exc:
+            raise KeyError(f"missing endpoint registration: {endpoint!r}") from exc
+
     def open_session(self, plan: PageTransferPlan) -> TransferIdentity:
         existing = self._sessions.get(plan.identity)
         if existing is not None:
@@ -287,6 +293,27 @@ class PageTransferSessionManager:
         if session.result is not None:
             return session.result
         return self._complete_session(session)
+
+    def complete_external(
+        self,
+        identity: TransferIdentity | PageReceiveReservation,
+    ) -> PageTransferResult:
+        session = self._get_session(identity)
+        if session.result is not None:
+            return session.result
+        if session.state is not TransferState.TARGET_READY:
+            raise ValueError(f"external page copy can complete only from target_ready, got {session.state.value}")
+        return self._complete_session(session)
+
+    def fail_external(
+        self,
+        identity: TransferIdentity | PageReceiveReservation,
+        message: str,
+    ) -> PageTransferResult:
+        session = self._get_session(identity)
+        if session.result is not None:
+            return session.result
+        return self._set_terminal(session, TransferState.FAILED, message=message)
 
     def cancel(
         self,

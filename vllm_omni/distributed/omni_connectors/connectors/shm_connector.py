@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import tempfile
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -28,11 +29,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
+        self._pending_sizes: dict[str, int] = {}
         self._metrics = {
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
         }
+
+    def _track_pending_key(self, key: str) -> None:
+        self._pending_keys.add(key)
+
+    def _discard_pending_key(self, key: str) -> None:
+        self._pending_keys.discard(key)
+        self._pending_sizes.pop(key, None)
+
+    @staticmethod
+    def _lock_file_path(key: str) -> str:
+        root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        return os.path.join(root, f"shm_{key}_lockfile.lock")
 
     def put(
         self,
@@ -45,7 +59,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+            lock_file = self._lock_file_path(put_key)
             with open(lock_file, "wb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 meta = shm_write_bytes(payload, name=put_key)
@@ -53,7 +67,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
-            self._pending_keys.add(put_key)
+            self._track_pending_key(put_key)
+            self._pending_sizes[put_key] = size
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -92,11 +107,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             shm = shm_pkg.SharedMemory(name=get_key)
             if shm is None or shm.size == 0:
                 return None
-            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-            shm_handle = {"name": get_key, "size": shm.size}
+            lock_file = self._lock_file_path(get_key)
+            shm_handle = {
+                "name": get_key,
+                "size": self._pending_sizes.get(get_key, shm.size),
+            }
             result = self._get_data_with_lock(lock_file, shm_handle)
             if result is not None:
-                self._pending_keys.discard(get_key)
+                self._discard_pending_key(get_key)
             return result
         except FileNotFoundError:
             return None
@@ -128,10 +146,10 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                lock_file = self._lock_file_path(shm_handle["name"])
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
-                    self._pending_keys.discard(get_key)
+                    self._discard_pending_key(get_key)
             else:
                 # Missing or non-SHM metadata falls back to key-based lookup.
                 result = self._get_by_key(get_key)
@@ -156,7 +174,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
         ]
         for key in stale:
-            self._pending_keys.discard(key)
+            self._discard_pending_key(key)
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
@@ -166,7 +184,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 pass
             except Exception as e:
                 logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = self._lock_file_path(key)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
@@ -182,13 +200,14 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.unlink()
             except Exception:
                 pass
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = self._lock_file_path(key)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
                 except OSError:
                     pass
         self._pending_keys.clear()
+        self._pending_sizes.clear()
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", **self._metrics}
