@@ -32,8 +32,11 @@ import pytest
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
-from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.sched.interface import (
+    RequestBatchSamplingParamsKey,
+    WorkerKVUpdate,
+)
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
 # Default values for every batch-key field, so SimpleNamespace-based
 # sampling_params satisfy ``RequestScheduler._build_sampling_params_key``'s attribute lookups.
@@ -517,6 +520,42 @@ def test_rpc_task_default_future_is_unique_per_instance():
     assert a.future is not b.future
     a.future.set_result("a")
     assert not b.future.done()
+
+
+def test_worker_kv_updates_apply_under_engine_lock_before_next_schedule():
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._worker_kv_updates = queue.SimpleQueue()
+    events: list[tuple[str, object]] = []
+
+    class _Scheduler:
+        def update_worker_kv(self, update):
+            assert engine._cv._is_owned()
+            events.append(("update", update))
+
+        def schedule(self):
+            assert engine._cv._is_owned()
+            events.append(("schedule", None))
+
+    engine.scheduler = _Scheduler()
+    update = WorkerKVUpdate(
+        request_id="req",
+        allocation_generation=7,
+        tp_rank=0,
+        status="ready",
+    )
+    runner_output = BatchRunnerOutput.from_list(
+        [],
+        worker_kv_updates=[update],
+    )
+    engine._queue_worker_kv_updates(runner_output)
+
+    with engine._cv:
+        engine._apply_worker_kv_updates_locked()
+        engine.scheduler.schedule()
+
+    assert events == [("update", update), ("schedule", None)]
 
 
 # ──────────────── busy-loop drains RPCs without scheduler work ─────────────

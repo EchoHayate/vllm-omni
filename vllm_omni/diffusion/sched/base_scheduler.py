@@ -14,17 +14,20 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
-from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
+    DiffusionKVReadiness,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     KVPrefetchJob,
     NewRequestData,
+    PageInstallRequest,
+    PageReleaseRequest,
     RequestBatchSamplingParamsKey,
     SchedulerRequestState,
     StepBatchSamplingParamsKey,
+    WorkerKVUpdate,
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -54,6 +57,8 @@ class BaseScheduler(ABC):
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
+        self._diffusion_kv_tp_size: int = 1
+        self._pending_kv_releases: dict[tuple[str, int], set[int]] = {}
 
     def initialize(
         self,
@@ -71,6 +76,7 @@ class BaseScheduler(ABC):
         self._running.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
+        self._pending_kv_releases.clear()
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
         try:
             self.max_num_running_reqs = max(1, int(max_num_seqs))
@@ -96,6 +102,11 @@ class BaseScheduler(ABC):
                 hash_block_size=hash_block_size,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
             )
+            parallel_config = getattr(od_config, "parallel_config", None)
+            self._diffusion_kv_tp_size = max(
+                1,
+                int(getattr(parallel_config, "tensor_parallel_size", 1)),
+            )
         else:
             if any(
                 value is not None
@@ -108,6 +119,7 @@ class BaseScheduler(ABC):
             ):
                 raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
             self._diffusion_kv_manager = None
+            self._diffusion_kv_tp_size = 1
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -123,6 +135,11 @@ class BaseScheduler(ABC):
         return request_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
+        if self._diffusion_kv_manager is not None:
+            return self._schedule_paged()
+        return self._schedule_dense()
+
+    def _schedule_dense(self) -> DiffusionSchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
         scheduled_cached_request_ids: list[str] = []
 
@@ -142,35 +159,6 @@ class BaseScheduler(ABC):
             if not self._can_schedule_waiting(state):
                 break
 
-            diffusion_kv_metadata: DiffusionKVMetadata | None = None
-            if self._diffusion_kv_manager is not None:
-                if self._diffusion_kv_manager.has_request(request_id):
-                    diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
-                else:
-                    try:
-                        allocation = self._diffusion_kv_manager.reserve_request(
-                            request_id,
-                            state.diffusion_kv_requests,
-                        )
-                    except Exception as exc:
-                        # schedule() runs outside the Engine execution-error
-                        # wrapper. Convert both expected admission failures and
-                        # unexpected native allocator failures into a terminal
-                        # request error so the busy loop can wake its stream.
-                        if not isinstance(exc, DiffusionKVAdmissionError):
-                            logger.exception(
-                                "Unexpected Diffusion KV allocation failure for request %s",
-                                request_id,
-                            )
-                        self._finish_requests(
-                            {request_id: DiffusionRequestStatus.FINISHED_ERROR},
-                            {request_id: str(exc)},
-                        )
-                        continue
-                    if allocation is None:
-                        break
-                    diffusion_kv_metadata = allocation
-
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
             if not self._running:
@@ -181,7 +169,6 @@ class BaseScheduler(ABC):
                 scheduled_new_reqs.append(
                     NewRequestData.from_state(
                         state,
-                        diffusion_kv_metadata=diffusion_kv_metadata,
                     )
                 )
             else:
@@ -210,6 +197,7 @@ class BaseScheduler(ABC):
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
+            page_release_reqs=self._page_release_requests_for_finished(),
             kv_prefetch_job=kv_prefetch_job,
         )
 
@@ -218,12 +206,164 @@ class BaseScheduler(ABC):
         self._finished_req_ids.clear()
         return scheduler_output
 
+    def _schedule_paged(self) -> DiffusionSchedulerOutput:
+        assert self._diffusion_kv_manager is not None
+        scheduled_new_reqs: list[NewRequestData] = []
+        scheduled_cached_request_ids = [
+            request_id for request_id in self._running if request_id in self._request_states
+        ]
+        for request_id in tuple(self._waiting):
+            state = self._request_states.get(request_id)
+            if state is None or state.is_finished() or state.kv_readiness is not DiffusionKVReadiness.UNALLOCATED:
+                continue
+            try:
+                metadata = self._diffusion_kv_manager.reserve_request(
+                    request_id,
+                    state.diffusion_kv_requests,
+                )
+            except Exception as exc:
+                if not isinstance(exc, DiffusionKVAdmissionError):
+                    logger.exception(
+                        "Unexpected Diffusion KV allocation failure for request %s",
+                        request_id,
+                    )
+                state.kv_readiness = DiffusionKVReadiness.FAILED
+                self._finish_requests(
+                    {request_id: DiffusionRequestStatus.FINISHED_ERROR},
+                    {request_id: str(exc)},
+                )
+                continue
+            if metadata is None:
+                continue
+            state.allocation_generation = metadata.allocation_generation
+            state.worker_kv_rank_status.clear()
+            state.kv_readiness = DiffusionKVReadiness.WAITING_FOR_LOCAL_KVS
+
+        page_install_reqs = [
+            PageInstallRequest(
+                request_id=request_id,
+                allocation_generation=state.allocation_generation,
+                metadata=self._diffusion_kv_manager.get_metadata(request_id),
+            )
+            for request_id in self._waiting
+            if (state := self._request_states.get(request_id)) is not None
+            and state.kv_readiness is DiffusionKVReadiness.WAITING_FOR_LOCAL_KVS
+            and state.allocation_generation is not None
+        ]
+
+        waiting_after_admission: deque[str] = deque()
+        for request_id in self._waiting:
+            state = self._request_states.get(request_id)
+            if state is None or state.is_finished():
+                continue
+            if len(self._running) >= self.max_num_running_reqs:
+                waiting_after_admission.append(request_id)
+                continue
+            if state.kv_readiness is not DiffusionKVReadiness.READY:
+                waiting_after_admission.append(request_id)
+                continue
+            if not self._can_schedule_waiting(state):
+                waiting_after_admission.append(request_id)
+                continue
+
+            if not self._running:
+                self._running_sampling_params_key = state.sampling_params_key
+            was_new_request = state.status == DiffusionRequestStatus.WAITING
+            state.status = DiffusionRequestStatus.RUNNING
+            self._running.append(request_id)
+            if was_new_request:
+                scheduled_new_reqs.append(NewRequestData.from_state(state))
+            else:
+                scheduled_cached_request_ids.append(request_id)
+
+        self._waiting = waiting_after_admission
+        kv_prefetch_job = self._build_kv_prefetch_job()
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=self._step_id,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_cached_reqs=CachedRequestData(request_ids=scheduled_cached_request_ids),
+            finished_req_ids=set(self._finished_req_ids),
+            num_running_reqs=len(self._running),
+            num_waiting_reqs=len(self._waiting),
+            page_install_reqs=page_install_reqs,
+            page_release_reqs=self._page_release_requests_for_finished(),
+            kv_prefetch_job=kv_prefetch_job,
+        )
+        self._step_id += 1
+        self._finished_req_ids.clear()
+        return scheduler_output
+
+    def update_worker_kv(self, update: WorkerKVUpdate) -> None:
+        if update.tp_rank < 0 or update.tp_rank >= self._diffusion_kv_tp_size:
+            raise ValueError(
+                "Diffusion KV update tp_rank is outside the active TP group: "
+                f"tp_rank={update.tp_rank}, tp_size={self._diffusion_kv_tp_size}"
+            )
+        if update.status == "released":
+            release_key = (
+                update.request_id,
+                update.allocation_generation,
+            )
+            released_ranks = self._pending_kv_releases.get(release_key)
+            if released_ranks is None:
+                return
+            released_ranks.add(update.tp_rank)
+            if len(released_ranks) == self._diffusion_kv_tp_size:
+                if self._diffusion_kv_manager is not None:
+                    self._diffusion_kv_manager.free_request(update.request_id)
+                self._pending_kv_releases.pop(release_key, None)
+            return
+
+        state = self._request_states.get(update.request_id)
+        if state is None or state.allocation_generation is None:
+            return
+        if update.allocation_generation != state.allocation_generation:
+            return
+        if state.is_finished():
+            return
+
+        state.worker_kv_rank_status[update.tp_rank] = update.status
+        if update.status == "failed":
+            state.kv_readiness = DiffusionKVReadiness.FAILED
+            self._finish_requests(
+                {update.request_id: DiffusionRequestStatus.FINISHED_ERROR},
+                {update.request_id: update.error or "Diffusion KV Worker failed"},
+            )
+            return
+        if update.status == "ready" and all(
+            state.worker_kv_rank_status.get(tp_rank) == "ready" for tp_rank in range(self._diffusion_kv_tp_size)
+        ):
+            state.kv_readiness = DiffusionKVReadiness.READY
+
+    def _build_kv_prefetch_job(self) -> KVPrefetchJob | None:
+        if not self._prefetch_enabled or not self._waiting:
+            return None
+        nxt = self._request_states.get(self._waiting[0])
+        if nxt is None or nxt.is_finished():
+            return None
+        sender_info = getattr(nxt.req, "kv_sender_info", None)
+        if not sender_info:
+            return None
+        return {
+            "request_id": nxt.request_id,
+            "kv_sender_info": sender_info,
+        }
+
+    def _page_release_requests_for_finished(self) -> list[PageReleaseRequest]:
+        return [
+            PageReleaseRequest(
+                request_id=request_id,
+                allocation_generation=allocation_generation,
+            )
+            for request_id, allocation_generation in self._pending_kv_releases
+        ]
+
     @abstractmethod
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         pass
 
     def has_requests(self) -> bool:
-        return bool(self._waiting or self._running)
+        return bool(self._waiting or self._running or self._pending_kv_releases)
 
     def num_waiting_requests(self) -> int:
         return len(self._waiting)
@@ -256,7 +396,20 @@ class BaseScheduler(ABC):
         return self._request_states.get(request_id)
 
     def pop_request_state(self, request_id: str) -> SchedulerRequestState | None:
-        if self._diffusion_kv_manager is not None:
+        state = self._request_states.get(request_id)
+        if (
+            self._diffusion_kv_manager is not None
+            and self._diffusion_kv_manager.has_request(request_id)
+            and (
+                state is None
+                or state.allocation_generation is None
+                or (
+                    request_id,
+                    state.allocation_generation,
+                )
+                not in self._pending_kv_releases
+            )
+        ):
             self._diffusion_kv_manager.free_request(request_id)
         self._pop_extra_request_state(request_id)
         return self._request_states.pop(request_id, None)
@@ -283,11 +436,13 @@ class BaseScheduler(ABC):
         if self._diffusion_kv_manager is not None:
             self._diffusion_kv_manager.close()
             self._diffusion_kv_manager = None
+        self._diffusion_kv_tp_size = 1
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
         self._running_sampling_params_key = None
         self._finished_req_ids.clear()
+        self._pending_kv_releases.clear()
         self._reset_scheduler_state()
 
     def _finish_requests(
@@ -322,9 +477,19 @@ class BaseScheduler(ABC):
             self._waiting = deque(request_id for request_id in self._waiting if request_id not in waiting_to_remove)
 
         for request_id in finished_req_ids:
-            if self._diffusion_kv_manager is not None:
-                self._diffusion_kv_manager.free_request(request_id)
             state = self._request_states[request_id]
+            if (
+                self._diffusion_kv_manager is not None
+                and state.allocation_generation is not None
+                and self._diffusion_kv_manager.has_request(request_id)
+            ):
+                self._pending_kv_releases.setdefault(
+                    (
+                        request_id,
+                        state.allocation_generation,
+                    ),
+                    set(),
+                )
             status = statuses[request_id]
             state.status = status
             if status == DiffusionRequestStatus.FINISHED_ERROR:
@@ -380,6 +545,11 @@ class BaseScheduler(ABC):
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
             diffusion_kv_requests=kv_requests,
+            kv_readiness=(
+                DiffusionKVReadiness.UNALLOCATED
+                if self._diffusion_kv_manager is not None
+                else DiffusionKVReadiness.READY
+            ),
         )
 
     @staticmethod

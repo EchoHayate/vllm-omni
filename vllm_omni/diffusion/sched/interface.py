@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -30,6 +30,46 @@ class DiffusionRequestStatus(enum.IntEnum):
     @staticmethod
     def is_finished(status: DiffusionRequestStatus) -> bool:
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
+
+
+class DiffusionKVReadiness(enum.Enum):
+    """Scheduler-owned readiness for paged diffusion KV allocations."""
+
+    UNALLOCATED = "unallocated"
+    WAITING_FOR_LOCAL_KVS = "waiting_for_local_kvs"
+    READY = "ready"
+    FAILED = "failed"
+
+
+WorkerKVStatus = Literal["ready", "failed", "released"]
+
+
+@dataclass(frozen=True)
+class WorkerKVUpdate:
+    """Rank-local page lifecycle update applied by the Scheduler."""
+
+    request_id: str
+    allocation_generation: int
+    tp_rank: int
+    status: WorkerKVStatus
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PageInstallRequest:
+    """Scheduler allocation that a Worker rank must bind and install."""
+
+    request_id: str
+    allocation_generation: int
+    metadata: DiffusionKVMetadata
+
+
+@dataclass(frozen=True)
+class PageReleaseRequest:
+    """Worker binding generation that must be released before block reuse."""
+
+    request_id: str
+    allocation_generation: int
 
 
 @dataclass(frozen=True)
@@ -157,6 +197,9 @@ class SchedulerRequestState:
     diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    kv_readiness: DiffusionKVReadiness = DiffusionKVReadiness.READY
+    allocation_generation: int | None = None
+    worker_kv_rank_status: dict[int, WorkerKVStatus] = field(default_factory=dict)
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -239,6 +282,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    page_install_reqs: list[PageInstallRequest] = field(default_factory=list)
+    page_release_reqs: list[PageReleaseRequest] = field(default_factory=list)
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
 
@@ -258,4 +303,4 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0
+        return self.num_scheduled_reqs == 0 and not self.page_install_reqs and not self.page_release_reqs

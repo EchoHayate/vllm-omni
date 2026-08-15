@@ -24,8 +24,9 @@ from vllm_omni.diffusion.sched import (
     Scheduler,
     StepScheduler,
 )
-from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.sched import interface as scheduler_interface
+from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, WorkerKVUpdate
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -94,6 +95,7 @@ def _initialize_paged_scheduler(
     *,
     num_blocks: int = 64,
     max_num_seqs: int = 1,
+    tp_size: int = 1,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(
@@ -112,6 +114,7 @@ def _initialize_paged_scheduler(
             diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
             max_model_len=64,
             max_num_seqs=max_num_seqs,
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
         ),
         kv_cache_config=config,
         scheduler_block_size=4,
@@ -123,7 +126,12 @@ def _initialize_paged_scheduler(
     )
 
 
-def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> None:
+def _attach_diffusion_kv(
+    request: OmniDiffusionRequest,
+    *,
+    seq_len: int = 8,
+    imported_prefix_token_count: int = 0,
+) -> None:
     request.diffusion_kv_requests = (
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/0",
@@ -131,6 +139,7 @@ def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> 
             prefix_len=4,
             target_len=4,
             seq_len=seq_len,
+            imported_prefix_token_count=imported_prefix_token_count,
         ),
     )
 
@@ -468,11 +477,183 @@ class TestRequestScheduler:
         assert state is not None
         assert state.diffusion_kv_requests == (kv_request,)
         assert request.diffusion_kv_requests is None
-        assert scheduler_output.scheduled_new_reqs[0].req.prepared_layout is prepared_layout
-        metadata = scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata
-        assert metadata is not None
+        assert scheduler_output.scheduled_new_reqs == []
+        install = scheduler_output.page_install_reqs[0]
+        metadata = install.metadata
         assert metadata.request_id == request.request_id
         assert len(metadata.sequences[0].block_ids[0]) == 4
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                request.request_id,
+                install.allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+
+        compute = self.scheduler.schedule()
+
+        assert compute.scheduled_new_reqs[0].req.prepared_layout is prepared_layout
+        assert compute.scheduled_new_reqs[0].diffusion_kv_metadata is None
+
+    def test_page_install_work_is_non_empty_without_compute(self) -> None:
+        _initialize_paged_scheduler(self.scheduler)
+        request = _make_request("install-only")
+        _attach_diffusion_kv(request, imported_prefix_token_count=4)
+        self.scheduler.add_request(request)
+
+        sched_output = self.scheduler.schedule()
+
+        assert sched_output.scheduled_request_ids == []
+        assert [item.request_id for item in sched_output.page_install_reqs] == ["install-only"]
+        assert sched_output.is_empty is False
+        retry = self.scheduler.schedule()
+        assert retry.page_install_reqs == sched_output.page_install_reqs
+
+    def test_waiting_for_local_kv_does_not_block_ready_request(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=1)
+        waiting = _make_request("waiting")
+        ready = _make_request("ready")
+        _attach_diffusion_kv(waiting, imported_prefix_token_count=4)
+        _attach_diffusion_kv(ready)
+        self.scheduler.add_request(waiting)
+        self.scheduler.add_request(ready)
+
+        allocation = self.scheduler.schedule()
+
+        assert [item.request_id for item in allocation.page_install_reqs] == [
+            "waiting",
+            "ready",
+        ]
+        ready_install = next(item for item in allocation.page_install_reqs if item.request_id == "ready")
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                request_id="ready",
+                allocation_generation=ready_install.allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+
+        compute = self.scheduler.schedule()
+
+        assert compute.scheduled_request_ids == ["ready"]
+        assert self.scheduler.get_request_state("waiting").kv_readiness is (
+            scheduler_interface.DiffusionKVReadiness.WAITING_FOR_LOCAL_KVS
+        )
+
+    def test_request_runs_only_after_all_tp_ranks_report_same_generation(
+        self,
+    ) -> None:
+        _initialize_paged_scheduler(self.scheduler, tp_size=2)
+        request = _make_request("tp-request")
+        _attach_diffusion_kv(request, imported_prefix_token_count=4)
+        self.scheduler.add_request(request)
+        allocation = self.scheduler.schedule()
+        generation = allocation.page_install_reqs[0].allocation_generation
+
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "tp-request",
+                generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+        assert self.scheduler.schedule().scheduled_request_ids == []
+
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "tp-request",
+                generation,
+                tp_rank=1,
+                status="ready",
+            )
+        )
+        assert self.scheduler.schedule().scheduled_request_ids == ["tp-request"]
+
+    def test_stale_generation_update_is_ignored(self) -> None:
+        _initialize_paged_scheduler(self.scheduler)
+        request = _make_request("stale")
+        _attach_diffusion_kv(request)
+        self.scheduler.add_request(request)
+        allocation = self.scheduler.schedule()
+        generation = allocation.page_install_reqs[0].allocation_generation
+
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "stale",
+                generation - 1,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+
+        assert self.scheduler.schedule().scheduled_request_ids == []
+        state = self.scheduler.get_request_state("stale")
+        assert state is not None
+        assert state.worker_kv_rank_status == {}
+
+    def test_one_rank_failure_finishes_public_request(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, tp_size=2)
+        request = _make_request("rank-failure")
+        _attach_diffusion_kv(request)
+        self.scheduler.add_request(request)
+        allocation = self.scheduler.schedule()
+        generation = allocation.page_install_reqs[0].allocation_generation
+
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "rank-failure",
+                generation,
+                tp_rank=1,
+                status="failed",
+                error="copy stream failed",
+            )
+        )
+        failed = self.scheduler.schedule()
+
+        state = self.scheduler.get_request_state("rank-failure")
+        assert state is not None
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "copy stream failed"
+        assert failed.finished_req_ids == {"rank-failure"}
+        assert failed.scheduled_request_ids == []
+
+    def test_ready_paged_requests_still_require_sampling_compatibility(
+        self,
+    ) -> None:
+        _initialize_paged_scheduler(self.scheduler, max_num_seqs=2)
+        first = _make_request("first")
+        incompatible = OmniDiffusionRequest(
+            prompt="prompt_incompatible",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                width=768,
+            ),
+            request_id="incompatible",
+        )
+        _attach_diffusion_kv(first)
+        _attach_diffusion_kv(incompatible)
+        self.scheduler.add_request(first)
+        self.scheduler.add_request(incompatible)
+        allocation = self.scheduler.schedule()
+
+        for install in allocation.page_install_reqs:
+            self.scheduler.update_worker_kv(
+                scheduler_interface.WorkerKVUpdate(
+                    install.request_id,
+                    install.allocation_generation,
+                    tp_rank=0,
+                    status="ready",
+                )
+            )
+
+        compute = self.scheduler.schedule()
+
+        assert compute.scheduled_request_ids == ["first"]
+        assert compute.num_running_reqs == 1
+        assert compute.num_waiting_reqs == 1
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)
@@ -483,20 +664,50 @@ class TestRequestScheduler:
         self.scheduler.add_request(first_request)
         self.scheduler.add_request(second_request)
 
-        first_output = self.scheduler.schedule()
+        first_install = self.scheduler.schedule()
 
+        assert _new_ids(first_install) == []
+        assert [item.request_id for item in first_install.page_install_reqs] == ["first"]
+        assert first_install.num_waiting_reqs == 2
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "first",
+                first_install.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+        first_output = self.scheduler.schedule()
         assert _new_ids(first_output) == ["first"]
         assert first_output.num_waiting_reqs == 1
 
         self.scheduler.update_from_output(first_output, _make_request_output("first"))
-        second_output = self.scheduler.schedule()
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "first",
+                first_install.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="released",
+            )
+        )
+        second_install = self.scheduler.schedule()
 
-        assert _new_ids(second_output) == ["second"]
-        assert second_output.num_waiting_reqs == 0
+        assert _new_ids(second_install) == []
+        assert [item.request_id for item in second_install.page_install_reqs] == ["second"]
         # The same output carries both the release and the newly admitted block
         # table; the future Worker data plane must process finished ids first.
-        assert second_output.finished_req_ids == {"first"}
-        assert second_output.scheduled_new_reqs[0].diffusion_kv_metadata is not None
+        assert second_install.finished_req_ids == {"first"}
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "second",
+                second_install.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+        second_output = self.scheduler.schedule()
+        assert _new_ids(second_output) == ["second"]
+        assert second_output.num_waiting_reqs == 0
 
     def test_impossible_diffusion_kv_capacity_finishes_only_that_request(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=2, max_num_seqs=2)
@@ -523,14 +734,26 @@ class TestRequestScheduler:
         assert failed_state.error is not None
         assert "cannot fit even when the block pool is empty" in failed_state.error
         assert sched_output.finished_req_ids == {"impossible"}
-        assert _new_ids(sched_output) == ["schedulable"]
+        assert _new_ids(sched_output) == []
+        assert [item.request_id for item in sched_output.page_install_reqs] == ["schedulable"]
+        install = sched_output.page_install_reqs[0]
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "schedulable",
+                install.allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+        compute = self.scheduler.schedule()
+        assert _new_ids(compute) == ["schedulable"]
 
         finished = self.scheduler.update_from_output(
-            sched_output,
+            compute,
             _make_request_output("schedulable"),
         )
 
-        assert finished == {"impossible", "schedulable"}
+        assert finished == {"schedulable"}
 
     def test_impossible_diffusion_kv_capacity_does_not_block_waiters_under_load(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=4, max_num_seqs=2)
@@ -604,6 +827,15 @@ class TestRequestScheduler:
         request = _make_request("preempted")
         _attach_diffusion_kv(request)
         self.scheduler.add_request(request)
+        allocation = self.scheduler.schedule()
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "preempted",
+                allocation.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
         self.scheduler.schedule()
         manager = self.scheduler._diffusion_kv_manager
         assert manager is not None
@@ -625,17 +857,50 @@ class TestRequestScheduler:
         ],
     )
     def test_diffusion_kv_terminal_status_releases_allocation(self, status: DiffusionRequestStatus) -> None:
-        _initialize_paged_scheduler(self.scheduler, num_blocks=3)
+        _initialize_paged_scheduler(self.scheduler, num_blocks=3, tp_size=2)
         request = _make_request("terminal")
         _attach_diffusion_kv(request)
         self.scheduler.add_request(request)
-        self.scheduler.schedule()
+        allocation = self.scheduler.schedule()
+        generation = allocation.page_install_reqs[0].allocation_generation
         manager = self.scheduler._diffusion_kv_manager
         assert manager is not None
         assert manager.has_request("terminal") is True
 
         self.scheduler.finish_requests("terminal", status)
 
+        assert manager.has_request("terminal") is True
+        self.scheduler.pop_request_state("terminal")
+        assert manager.has_request("terminal") is True
+        assert self.scheduler.has_requests() is True
+        release_output = self.scheduler.schedule()
+        assert release_output.scheduled_request_ids == []
+        assert [
+            (
+                release.request_id,
+                release.allocation_generation,
+            )
+            for release in release_output.page_release_reqs
+        ] == [("terminal", generation)]
+        retry_release_output = self.scheduler.schedule()
+        assert retry_release_output.page_release_reqs == release_output.page_release_reqs
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "terminal",
+                generation,
+                tp_rank=0,
+                status="released",
+            )
+        )
+        assert manager.has_request("terminal") is True
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "terminal",
+                generation,
+                tp_rank=1,
+                status="released",
+            )
+        )
         assert manager.has_request("terminal") is False
 
     def test_paged_scheduler_rejects_missing_kv_request(self) -> None:
@@ -1061,6 +1326,18 @@ class TestRequestScheduler:
 
 
 class TestDiffusionEngine:
+    @staticmethod
+    def _make_sync_engine(scheduler, execute_fn) -> DiffusionEngine:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(streaming_output=False)
+        engine.scheduler = scheduler
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
+        engine.abort_queue = queue.Queue()
+        engine.execute_fn = execute_fn
+        return engine
+
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = SimpleNamespace(streaming_output=False)
@@ -1106,6 +1383,109 @@ class TestDiffusionEngine:
 
         assert output is runner_output.result
         engine.execute_fn.assert_called_once()
+
+    def test_sync_engine_executes_control_only_cycle_before_compute(self, mocker: MockerFixture) -> None:
+        request = _make_request("engine-control")
+        runner_output = _make_request_output(request.request_id)
+        ready_update = WorkerKVUpdate(
+            request_id=request.request_id,
+            allocation_generation=1,
+            tp_rank=0,
+            status="ready",
+        )
+
+        class _ControlThenComputeScheduler(_StubScheduler):
+            def __init__(self) -> None:
+                super().__init__(request, runner_output)
+                self._control_scheduled = False
+                self.worker_updates = []
+
+            def schedule(self):
+                if not self._control_scheduled:
+                    self._control_scheduled = True
+                    return SimpleNamespace(
+                        scheduled_request_ids=[],
+                        finished_req_ids=set(),
+                        is_empty=False,
+                    )
+                return super().schedule()
+
+            def update_worker_kv(self, update) -> None:
+                self.worker_updates.append(update)
+
+            def update_from_output(self, sched_output, output) -> set[str]:
+                if not sched_output.scheduled_request_ids:
+                    return set()
+                return super().update_from_output(sched_output, output)
+
+        scheduler = _ControlThenComputeScheduler()
+        control_output = BatchRunnerOutput.from_list([], worker_kv_updates=[ready_update])
+        execute_fn = mocker.Mock(side_effect=[control_output, runner_output])
+        engine = self._make_sync_engine(scheduler, execute_fn)
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert output is runner_output.result
+        assert scheduler.worker_updates == [ready_update]
+        assert execute_fn.call_count == 2
+
+    def test_sync_engine_drains_page_release_before_returning(self, mocker: MockerFixture) -> None:
+        request = _make_request("engine-release")
+        runner_output = _make_request_output(request.request_id)
+        released_update = WorkerKVUpdate(
+            request_id=request.request_id,
+            allocation_generation=1,
+            tp_rank=0,
+            status="released",
+        )
+
+        class _ComputeThenReleaseScheduler(_StubScheduler):
+            def __init__(self) -> None:
+                super().__init__(request, runner_output)
+                self._release_pending = False
+                self._release_scheduled = False
+
+            def schedule(self):
+                if self._release_pending and not self._release_scheduled:
+                    self._release_scheduled = True
+                    return SimpleNamespace(
+                        scheduled_request_ids=[],
+                        finished_req_ids=set(),
+                        is_empty=False,
+                    )
+                if self._release_pending:
+                    return SimpleNamespace(
+                        scheduled_request_ids=[],
+                        finished_req_ids=set(),
+                        is_empty=True,
+                    )
+                return super().schedule()
+
+            def update_from_output(self, sched_output, output) -> set[str]:
+                if sched_output.scheduled_request_ids:
+                    finished = super().update_from_output(sched_output, output)
+                    self._release_pending = True
+                    return finished
+                return set()
+
+            def update_worker_kv(self, update) -> None:
+                assert update == released_update
+                self._release_pending = False
+
+            def has_requests(self) -> bool:
+                return self._release_pending or super().has_requests()
+
+        scheduler = _ComputeThenReleaseScheduler()
+        release_output = BatchRunnerOutput.from_list([], worker_kv_updates=[released_update])
+        execute_fn = mocker.Mock(side_effect=[runner_output, release_output])
+        engine = self._make_sync_engine(scheduler, execute_fn)
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert output is runner_output.result
+        assert scheduler._release_scheduled
+        assert not scheduler._release_pending
+        assert execute_fn.call_count == 2
 
     def test_initializes_default_request_scheduler(
         self,

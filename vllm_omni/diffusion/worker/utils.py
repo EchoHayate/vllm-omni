@@ -12,6 +12,7 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.sched.interface import WorkerKVUpdate
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -195,6 +196,7 @@ class RunnerOutput(BaseRunnerOutput):
 @dataclass
 class BatchRunnerOutput(BaseRunnerOutput):
     runner_outputs: list[RunnerOutput]
+    worker_kv_updates: list[WorkerKVUpdate] = field(default_factory=list)
     _id_to_idx: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -216,5 +218,13 @@ class BatchRunnerOutput(BaseRunnerOutput):
         return len(self.runner_outputs)
 
     @classmethod
-    def from_list(cls, runner_output_list: list[RunnerOutput]) -> BatchRunnerOutput:
-        return cls(runner_outputs=runner_output_list)
+    def from_list(
+        cls,
+        runner_output_list: list[RunnerOutput],
+        *,
+        worker_kv_updates: list[WorkerKVUpdate] | None = None,
+    ) -> BatchRunnerOutput:
+        return cls(
+            runner_outputs=runner_output_list,
+            worker_kv_updates=worker_kv_updates or [],
+        )

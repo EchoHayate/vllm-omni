@@ -21,6 +21,9 @@ from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
     NewRequestData,
+    PageInstallRequest,
+    PageReleaseRequest,
+    WorkerKVUpdate,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerWrapperBase
@@ -68,6 +71,8 @@ def make_scheduler_output(
     *new_reqs: NewRequestData,
     cached: tuple[str, ...] = (),
     finished: set[str] | None = None,
+    page_installs: tuple[PageInstallRequest, ...] = (),
+    page_releases: tuple[PageReleaseRequest, ...] = (),
 ) -> DiffusionSchedulerOutput:
     return DiffusionSchedulerOutput(
         step_id=0,
@@ -76,6 +81,8 @@ def make_scheduler_output(
         finished_req_ids=finished or set(),
         num_running_reqs=len(new_reqs) + len(cached),
         num_waiting_reqs=0,
+        page_install_reqs=list(page_installs),
+        page_release_reqs=list(page_releases),
     )
 
 
@@ -183,6 +190,47 @@ def test_request_rpc_rejects_envelope_request_identity_mismatch() -> None:
         executor.execute_request(make_scheduler_output(new_req))
 
     assert calls == []
+
+
+def test_executor_runs_page_control_on_all_ranks_without_model_request() -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace(
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+    )
+    executor._ensure_open = lambda: None
+    update_rank0 = WorkerKVUpdate("req", 1, tp_rank=0, status="ready")
+    update_rank1 = WorkerKVUpdate("req", 1, tp_rank=1, status="ready")
+    calls = []
+
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+        calls.append((method, args, unique_reply_rank, exec_all_ranks))
+        return [[update_rank0], [update_rank1]]
+
+    executor.collective_rpc = collective_rpc
+    metadata = make_metadata("req")
+    scheduler_output = make_scheduler_output(
+        page_installs=(
+            PageInstallRequest(
+                request_id="req",
+                allocation_generation=1,
+                metadata=metadata,
+            ),
+        )
+    )
+
+    output = executor.execute_request(scheduler_output)
+
+    assert output.runner_outputs == []
+    assert output.worker_kv_updates == [update_rank0, update_rank1]
+    assert calls == [
+        (
+            "update_diffusion_kv_pages",
+            (scheduler_output,),
+            None,
+            True,
+        )
+    ]
 
 
 def test_batch_path_rejects_missing_metadata_before_forward() -> None:
@@ -534,6 +582,69 @@ def test_finished_ids_release_before_rebinding_reused_block_ids() -> None:
     assert tuple(bindings) == ("new",)
 
 
+def test_page_control_installs_ready_binding_and_reports_rank_update() -> None:
+    binding = SimpleNamespace(
+        request_id="req",
+        allocation_generation=1,
+        is_compute_ready=True,
+    )
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = SimpleNamespace(
+        bind_request=Mock(return_value=binding),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+    )
+    metadata = make_metadata("req")
+
+    updates = runner._process_diffusion_page_control(
+        make_scheduler_output(
+            page_installs=(
+                PageInstallRequest(
+                    request_id="req",
+                    allocation_generation=1,
+                    metadata=metadata,
+                ),
+            )
+        )
+    )
+
+    assert [(update.request_id, update.status, update.tp_rank) for update in updates] == [("req", "ready", 0)]
+    assert runner._diffusion_page_bindings == {"req": binding}
+
+
+def test_page_control_reports_release_after_worker_binding_cleanup() -> None:
+    calls = []
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = SimpleNamespace(
+        release_request=lambda request_id, generation: calls.append(("release", request_id, generation))
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        unregister_binding=lambda request_id, generation: calls.append(("unregister", request_id, generation))
+    )
+    runner._diffusion_page_bindings["req"] = SimpleNamespace(
+        request_id="req",
+        allocation_generation=3,
+    )
+
+    updates = runner._process_diffusion_page_control(
+        make_scheduler_output(
+            page_releases=(
+                PageReleaseRequest(
+                    request_id="req",
+                    allocation_generation=3,
+                ),
+            )
+        )
+    )
+
+    assert calls == [
+        ("unregister", "req", 3),
+        ("release", "req", 3),
+    ]
+    assert [(update.request_id, update.status, update.tp_rank) for update in updates] == [("req", "released", 0)]
+
+
 def test_cached_step_reuses_the_original_page_binding() -> None:
     binding = SimpleNamespace(request_id="req", allocation_generation=7)
     registry = SimpleNamespace(bind_request=Mock(return_value=binding))
@@ -552,7 +663,7 @@ def test_cached_step_reuses_the_original_page_binding() -> None:
     registry.bind_request.assert_called_once()
 
 
-def test_duplicate_new_request_preserves_existing_page_binding() -> None:
+def test_scheduled_new_request_reuses_control_installed_page_binding() -> None:
     binding = SimpleNamespace(request_id="req", allocation_generation=7)
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
     runner.page_registry = SimpleNamespace(
@@ -565,9 +676,9 @@ def test_duplicate_new_request_preserves_existing_page_binding() -> None:
     )
     runner._diffusion_page_bindings["req"] = binding
 
-    with pytest.raises(ValueError, match="duplicate new-request page binding"):
-        runner._prepare_diffusion_page_bindings(make_scheduler_output(make_new_request("req", generation=7)))
+    bindings = runner._prepare_diffusion_page_bindings(make_scheduler_output(make_new_request("req", generation=7)))
 
+    assert bindings == {"req": binding}
     assert runner._diffusion_page_bindings == {"req": binding}
     runner.page_registry.bind_request.assert_not_called()
     runner.page_registry.release_request.assert_not_called()

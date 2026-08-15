@@ -456,6 +456,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
+        worker_kv_updates = self._execute_page_control(scheduler_output)
 
         # Validate every envelope before selecting a dispatch path. In
         # particular, keep identity errors outside the RPC error wrapper so an
@@ -539,7 +540,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             result=DiffusionOutput(error=str(exc)),
                         )
                     )
-            return BatchRunnerOutput.from_list(runner_outputs)
+            return BatchRunnerOutput.from_list(
+                runner_outputs,
+                worker_kv_updates=worker_kv_updates,
+            )
 
         for new_req in new_reqs:
             req = new_req.req
@@ -584,7 +588,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     )
                 )
 
-        return BatchRunnerOutput.from_list(runner_outputs)
+        return BatchRunnerOutput.from_list(
+            runner_outputs,
+            worker_kv_updates=worker_kv_updates,
+        )
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work through the unified request-batch path.
@@ -602,6 +609,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
+        worker_kv_updates = self._execute_page_control(scheduler_output)
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
@@ -656,16 +664,29 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     batch_output = None
                     error = str(exc)
                 self._deliver_batch_split(per_req_map, batch_output, error)
-            return BatchRunnerOutput.from_list(runner_outputs)
+            return BatchRunnerOutput.from_list(
+                runner_outputs,
+                worker_kv_updates=worker_kv_updates,
+            )
         if not isinstance(result, BatchRunnerOutput):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
+        result.worker_kv_updates.extend(worker_kv_updates)
         return result
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+        from vllm_omni.diffusion.worker.utils import (
+            BaseRunnerOutput,
+            BatchRunnerOutput,
+        )
 
         self._ensure_open()
+        worker_kv_updates = self._execute_page_control(scheduler_output)
+        if not scheduler_output.scheduled_request_ids:
+            return BatchRunnerOutput.from_list(
+                [],
+                worker_kv_updates=worker_kv_updates,
+            )
         result = self.collective_rpc(
             "execute_stepwise",
             args=(scheduler_output,),
@@ -674,8 +695,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
 
         if isinstance(result, BaseRunnerOutput):
+            if isinstance(result, BatchRunnerOutput):
+                result.worker_kv_updates.extend(worker_kv_updates)
             return result
         raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
+    def _execute_page_control(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ):
+        if not getattr(scheduler_output, "page_install_reqs", ()) and not getattr(
+            scheduler_output, "page_release_reqs", ()
+        ):
+            return []
+        results = self.collective_rpc(
+            "update_diffusion_kv_pages",
+            args=(scheduler_output,),
+            unique_reply_rank=None,
+            exec_all_ranks=True,
+        )
+        if not isinstance(results, list):
+            results = [results]
+        return [update for rank_updates in results for update in rank_updates]
 
     def collective_rpc(
         self,

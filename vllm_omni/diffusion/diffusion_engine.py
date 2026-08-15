@@ -51,7 +51,10 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionRequestStatus,
+    WorkerKVUpdate,
+)
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -331,6 +334,7 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        self._worker_kv_updates: queue.SimpleQueue[WorkerKVUpdate] = queue.SimpleQueue()
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -506,6 +510,7 @@ class DiffusionEngine:
 
                 self._wait_for_admission_if_needed_locked()
 
+                self._apply_worker_kv_updates_locked()
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
@@ -530,6 +535,7 @@ class DiffusionEngine:
                     ]
                 )
 
+            self._queue_worker_kv_updates(runner_output)
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
@@ -624,6 +630,35 @@ class DiffusionEngine:
             else:
                 if not fut.done():
                     fut.set_result(result)
+
+    def update_worker_kv(self, update: WorkerKVUpdate) -> None:
+        """Queue a rank-local page update for the next Scheduler cycle."""
+
+        with self._cv:
+            if not hasattr(self, "_worker_kv_updates"):
+                self._worker_kv_updates = queue.SimpleQueue()
+            self._worker_kv_updates.put(update)
+            self._cv.notify_all()
+
+    def _queue_worker_kv_updates(
+        self,
+        runner_output: BaseRunnerOutput,
+    ) -> None:
+        for update in getattr(runner_output, "worker_kv_updates", ()):
+            self.update_worker_kv(update)
+
+    def _apply_worker_kv_updates_locked(self) -> None:
+        """Apply all pending Worker updates while holding the Engine lock."""
+
+        updates = getattr(self, "_worker_kv_updates", None)
+        if updates is None:
+            return
+        while True:
+            try:
+                update = updates.get_nowait()
+            except queue.Empty:
+                return
+            self.scheduler.update_worker_kv(update)
 
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:
@@ -845,26 +880,32 @@ class DiffusionEngine:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_request_id = self.scheduler.add_request(request)
+            final_output: DiffusionOutput | None = None
 
             # keep scheduling and executing until the target request is finished
             while True:
                 self._process_aborts_queue()
+                self._apply_worker_kv_updates_locked()
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
-                    if target_request_id in sched_output.finished_req_ids:
-                        return self._finalize_finished_request(target_request_id)
+                    if final_output is None and target_request_id in sched_output.finished_req_ids:
+                        final_output = self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
+                        if final_output is not None:
+                            return final_output
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
                 # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
                 # within _dummy_run, only one request will be scheduled
-                request_id = sched_output.scheduled_request_ids[0]
+                request_id = sched_output.scheduled_request_ids[0] if sched_output.scheduled_request_ids else None
                 try:
                     runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
                 except EngineDeadError:
                     raise
                 except Exception as exc:
+                    if request_id is None:
+                        raise
                     logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
                     runner_output = RunnerOutput(
                         request_id=request_id,
@@ -873,24 +914,30 @@ class DiffusionEngine:
                         result=DiffusionOutput.from_exception(exc),
                     )
 
+                self._queue_worker_kv_updates(runner_output)
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
 
                 # sync func should receive one result
-                if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
+                if (
+                    sched_output.scheduled_request_ids
+                    and not isinstance(runner_output, RunnerOutput)
+                    and not len(runner_output) == 1
+                ):
                     raise ValueError("Sync func should receive one result at one time")
-                if target_request_id in finished_req_ids:
+                if final_output is None and target_request_id in finished_req_ids:
                     req_output = runner_output.get_request_output(target_request_id)
-                    output = self._finalize_finished_request(
+                    final_output = self._finalize_finished_request(
                         target_request_id,
                         runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
-                    if output.async_output_id:
-                        fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
-                    return output
+                    if final_output.async_output_id:
+                        fut = self.executor.wait_output_ready(final_output.async_output_id)
+                        final_output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                if final_output is not None and not self.scheduler.has_requests():
+                    return final_output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling on all diffusion workers.

@@ -596,6 +596,15 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def update_diffusion_kv_pages(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ):
+        """Apply page install/release control work without model execution."""
+
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner._process_diffusion_page_control(scheduler_output)
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"

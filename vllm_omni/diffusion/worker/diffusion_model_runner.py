@@ -54,6 +54,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     KVPrefetchJob,
     NewRequestData,
+    WorkerKVUpdate,
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
@@ -182,7 +183,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         metadata: DiffusionKVMetadata | None,
     ) -> None:
         cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-        if cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is None:
+        if (
+            cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and metadata is None
+            and request_id not in self._diffusion_page_bindings
+        ):
             raise ValueError(f"paged_scheduler request {request_id!r} requires Diffusion KV metadata")
         if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is not None:
             raise ValueError(f"{cache_mode.value} request {request_id!r} must not carry Diffusion KV metadata")
@@ -540,19 +545,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def release_diffusion_kv_requests(self, request_ids: set[str]) -> None:
         if not request_ids:
             return
-        if self.page_registry is None or self.page_transfer_manager is None:
-            if self._diffusion_page_bindings:
+        page_registry = getattr(self, "page_registry", None)
+        page_transfer_manager = getattr(self, "page_transfer_manager", None)
+        bindings = getattr(self, "_diffusion_page_bindings", {})
+        if page_registry is None or page_transfer_manager is None:
+            if bindings:
                 raise RuntimeError("Diffusion KV bindings exist without an initialized data plane")
             return
         for request_id in request_ids:
-            binding = self._diffusion_page_bindings.pop(request_id, None)
+            binding = bindings.pop(request_id, None)
             if binding is None:
                 continue
-            self.page_transfer_manager.unregister_binding(
+            page_transfer_manager.unregister_binding(
                 request_id,
                 binding.allocation_generation,
             )
-            self.page_registry.release_request(
+            page_registry.release_request(
                 request_id,
                 binding.allocation_generation,
             )
@@ -570,18 +578,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         try:
             for new_req in scheduler_output.scheduled_new_reqs:
                 validate_new_request_data_identity(new_req)
-                if new_req.request_id in self._diffusion_page_bindings:
-                    raise ValueError(
-                        f"Received duplicate new-request page binding for cached request {new_req.request_id!r}"
-                    )
                 metadata = new_req.diffusion_kv_metadata
                 self._validate_diffusion_kv_metadata(
                     request_id=new_req.request_id,
                     metadata=metadata,
                 )
                 assert metadata is not None
+                had_binding = new_req.request_id in self._diffusion_page_bindings
                 self.install_diffusion_kv_metadata(new_req.request_id, metadata)
-                newly_installed.add(new_req.request_id)
+                if not had_binding:
+                    newly_installed.add(new_req.request_id)
 
             bindings: dict[str, DiffusionPageBinding] = {}
             for request_id in scheduler_output.scheduled_request_ids:
@@ -593,6 +599,68 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         except Exception:
             self.release_diffusion_kv_requests(newly_installed)
             raise
+
+    def _process_diffusion_page_control(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+    ) -> list[WorkerKVUpdate]:
+        cache_mode = getattr(
+            self.od_config,
+            "diffusion_kv_mode",
+            DiffusionKVCacheMode.DENSE_LEGACY,
+        )
+        if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return []
+
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+        tp_rank = get_tensor_model_parallel_rank() if torch.distributed.is_initialized() else 0
+        updates: list[WorkerKVUpdate] = []
+        for release_req in scheduler_output.page_release_reqs:
+            binding = self._diffusion_page_bindings.get(release_req.request_id)
+            if binding is not None and binding.allocation_generation == release_req.allocation_generation:
+                self.release_diffusion_kv_requests({release_req.request_id})
+            updates.append(
+                WorkerKVUpdate(
+                    request_id=release_req.request_id,
+                    allocation_generation=release_req.allocation_generation,
+                    tp_rank=tp_rank,
+                    status="released",
+                )
+            )
+
+        for install_req in scheduler_output.page_install_reqs:
+            try:
+                if (
+                    install_req.metadata.request_id != install_req.request_id
+                    or install_req.metadata.allocation_generation != install_req.allocation_generation
+                ):
+                    raise ValueError("Diffusion page-install identity does not match its metadata")
+                binding = self.install_diffusion_kv_metadata(
+                    install_req.request_id,
+                    install_req.metadata,
+                )
+                if getattr(binding, "is_compute_ready", True):
+                    updates.append(
+                        WorkerKVUpdate(
+                            request_id=install_req.request_id,
+                            allocation_generation=install_req.allocation_generation,
+                            tp_rank=tp_rank,
+                            status="ready",
+                        )
+                    )
+            except Exception as exc:
+                self.release_diffusion_kv_requests({install_req.request_id})
+                updates.append(
+                    WorkerKVUpdate(
+                        request_id=install_req.request_id,
+                        allocation_generation=install_req.allocation_generation,
+                        tp_rank=tp_rank,
+                        status="failed",
+                        error=str(exc),
+                    )
+                )
+        return updates
 
     def shutdown_kv_cache_data_plane(self) -> None:
         if self.page_transfer_manager is not None:
@@ -961,6 +1029,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
         page_bindings = self._prepare_diffusion_page_bindings(scheduler_output)
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
+        if not reqs:
+            return BatchRunnerOutput.from_list([])
         try:
             return self._execute_request_list(
                 reqs,
@@ -1096,16 +1166,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
+        scheduled_request_ids = getattr(
+            scheduler_output,
+            "scheduled_request_ids",
+            [
+                *(new_req.request_id for new_req in scheduler_output.scheduled_new_reqs),
+                *scheduler_output.scheduled_cached_reqs.request_ids,
+            ],
+        )
+        if not scheduled_request_ids:
+            return BatchRunnerOutput.from_list([])
         # Stepwise mode only supports the basic state-driven denoise path for now.
         # Request-mode extras such as cache backends, editing inputs, and
         # similar features are not supported here yet.
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
+        bindings_before_prepare = set(getattr(self, "_diffusion_page_bindings", {}))
         page_bindings = self._prepare_diffusion_page_bindings(scheduler_output)
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        new_page_request_ids = {new_req.request_id for new_req in scheduler_output.scheduled_new_reqs}
+        new_page_request_ids = set(getattr(self, "_diffusion_page_bindings", {})) - bindings_before_prepare
         with (
             grad_context,
             self._release_new_page_bindings_on_error(new_page_request_ids),
