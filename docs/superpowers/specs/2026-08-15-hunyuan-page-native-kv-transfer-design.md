@@ -1,6 +1,6 @@
 # HunyuanImage3 Page-Native KV Transfer Design
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved design; W2a implementation plan prepared
 
 **Date:** 2026-08-15
 
