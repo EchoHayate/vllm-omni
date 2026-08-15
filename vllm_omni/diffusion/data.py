@@ -859,6 +859,12 @@ class OmniDiffusionConfig:
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
+    # Page-native transfer safety bounds. Dense mode retains these values for
+    # config round-tripping but does not initialize or consume the page data plane.
+    diffusion_page_transfer_timeout_s: float = 30.0
+    diffusion_page_max_in_flight_bytes: int = 8 * 1024**3
+    diffusion_page_max_sessions: int = 8
+
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
@@ -952,6 +958,25 @@ class OmniDiffusionConfig:
             raise ValueError("max_num_batched_tokens must be positive")
         if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
             raise ValueError("max_model_len must be positive or -1")
+        try:
+            self.diffusion_page_transfer_timeout_s = float(self.diffusion_page_transfer_timeout_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "diffusion_page_transfer_timeout_s must be a finite positive number, "
+                f"got {self.diffusion_page_transfer_timeout_s!r}"
+            ) from exc
+        if not math.isfinite(self.diffusion_page_transfer_timeout_s) or self.diffusion_page_transfer_timeout_s <= 0:
+            raise ValueError(
+                "diffusion_page_transfer_timeout_s must be a finite positive number, "
+                f"got {self.diffusion_page_transfer_timeout_s!r}"
+            )
+        for field_name in (
+            "diffusion_page_max_in_flight_bytes",
+            "diffusion_page_max_sessions",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer, got {value!r}")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}

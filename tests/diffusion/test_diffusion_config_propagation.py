@@ -145,6 +145,53 @@ class TestCreateDefaultDiffusion:
         assert od.max_num_batched_tokens == 2048
         assert od.max_model_len == 4096
 
+    def test_diffusion_page_transfer_bounds_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_page_transfer_timeout_s=12.5,
+            diffusion_page_max_in_flight_bytes=1024,
+            diffusion_page_max_sessions=3,
+        )
+
+        assert od.diffusion_page_transfer_timeout_s == 12.5
+        assert od.diffusion_page_max_in_flight_bytes == 1024
+        assert od.diffusion_page_max_sessions == 3
+
+    def test_diffusion_page_transfer_bounds_have_bounded_defaults(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+        od = OmniDiffusionConfig(model="x")
+
+        assert od.diffusion_page_transfer_timeout_s == 30.0
+        assert od.diffusion_page_max_in_flight_bytes == 8 * 1024**3
+        assert od.diffusion_page_max_sessions == 8
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("diffusion_page_transfer_timeout_s", 0),
+        ("diffusion_page_transfer_timeout_s", float("inf")),
+        ("diffusion_page_transfer_timeout_s", float("nan")),
+        ("diffusion_page_max_in_flight_bytes", 0),
+        ("diffusion_page_max_sessions", -1),
+    ],
+)
+def test_diffusion_page_transfer_bounds_reject_invalid_values(
+    monkeypatch,
+    field_name,
+    value,
+):
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+
+    with pytest.raises(ValueError, match=rf"{field_name}.*{value!r}"):
+        OmniDiffusionConfig(
+            model="x",
+            **{field_name: value},
+        )
+
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(model="Qwen/Qwen-Image-Edit-2511", model_class_name="QwenImageEditPlusPipeline")

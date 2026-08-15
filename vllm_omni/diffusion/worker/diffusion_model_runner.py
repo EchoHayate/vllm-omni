@@ -295,6 +295,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        self._validate_page_native_capability()
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -388,6 +389,83 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         logger.info("Model runner: Initialization complete.")
+
+    def _validate_page_native_capability(self) -> None:
+        if (
+            getattr(
+                self.od_config,
+                "diffusion_kv_mode",
+                DiffusionKVCacheMode.DENSE_LEGACY,
+            )
+            is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            return
+
+        model_name = str(getattr(self.od_config, "model_class_name", type(self.pipeline).__name__))
+        attention_config = getattr(self.od_config, "diffusion_attention_config", None)
+        attention_spec = None
+        if attention_config is not None:
+            attention_spec, _ = attention_config.resolve_with_source(role="self")
+        backend_name = attention_spec.backend.upper() if attention_spec is not None else "AUTO"
+        platform_name = str(
+            getattr(
+                current_omni_platform,
+                "device_type",
+                getattr(self.device, "type", "unknown"),
+            )
+        )
+
+        omni_kv_config = getattr(self.od_config, "omni_kv_config", None)
+        connector_config = omni_kv_config.get("connector_config") if isinstance(omni_kv_config, dict) else None
+        if connector_config is None:
+            connector_name = "direct"
+        elif isinstance(connector_config, dict):
+            connector_name = str(connector_config.get("type") or "invalid")
+        else:
+            connector_name = type(connector_config).__name__
+
+        parallel_config = self.od_config.parallel_config
+        topology_name = (
+            f"tp={getattr(parallel_config, 'tensor_parallel_size', 1)},"
+            f"dp={getattr(parallel_config, 'data_parallel_size', 1)},"
+            f"sp={getattr(parallel_config, 'sequence_parallel_size', 1)},"
+            f"cfg={getattr(parallel_config, 'cfg_parallel_size', 1)},"
+            f"ulysses={getattr(parallel_config, 'ulysses_degree', 1)},"
+            f"ring={getattr(parallel_config, 'ring_degree', 1)},"
+            f"allgather={getattr(parallel_config, 'allgather_degree', 1)}"
+        )
+
+        reason = None
+        if model_name != "HunyuanImage3ForCausalMM":
+            reason = f"W2a page-native KV only supports HunyuanImage3, got {model_name}"
+        elif not getattr(self.pipeline, "supports_page_native_kv", False):
+            reason = "model pipeline does not declare Hunyuan page-native KV support"
+        elif not current_omni_platform.is_cuda():
+            reason = "W2a page-native KV requires a CUDA platform"
+        elif backend_name != "TORCH_SDPA":
+            reason = f"W2a requires the TORCH_SDPA reference backend, got {backend_name}"
+        elif connector_name not in {
+            "direct",
+            "SharedMemoryConnector",
+            "SharedMemoryPageAdapter",
+        }:
+            reason = f"connector {connector_name!r} is not a W2a direct/SharedMemory page adapter"
+        elif (
+            getattr(parallel_config, "sequence_parallel_size", 1) > 1
+            or getattr(parallel_config, "ulysses_degree", 1) > 1
+            or getattr(parallel_config, "ring_degree", 1) > 1
+            or getattr(parallel_config, "allgather_degree", 1) > 1
+        ):
+            reason = "sequence-parallel and AllGather page layouts are unsupported in W2a"
+        elif getattr(parallel_config, "cfg_parallel_size", 1) > 1:
+            reason = "CFG parallel page layouts are unsupported in W2a"
+
+        if reason is not None:
+            raise ValueError(
+                "paged_scheduler is unsupported for "
+                f"model={model_name}, backend={backend_name}, platform={platform_name}, "
+                f"connector={connector_name}, topology={topology_name}: {reason}"
+            )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Collect native specs from cache-enabled loaded attention modules."""

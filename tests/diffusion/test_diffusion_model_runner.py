@@ -10,7 +10,8 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
@@ -161,6 +162,116 @@ def _fake_platform_for_peak_memory():
         max_memory_reserved=lambda: 0,
         max_memory_allocated=lambda: 0,
     )
+
+
+def _make_page_native_capability_runner(
+    *,
+    cache_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+    model_class_name="HunyuanImage3ForCausalMM",
+    backend="TORCH_SDPA",
+    connector_type=None,
+    sequence_parallel_size=1,
+    allgather_degree=1,
+    cfg_parallel_size=1,
+    page_native_pipeline=True,
+):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.device = torch.device("cuda")
+    runner.pipeline = SimpleNamespace(supports_page_native_kv=page_native_pipeline)
+    connector_config = None if connector_type is None else {"type": connector_type}
+    runner.od_config = SimpleNamespace(
+        diffusion_kv_mode=cache_mode,
+        model_class_name=model_class_name,
+        diffusion_attention_config=AttentionConfig(
+            default=AttentionSpec(backend=backend),
+        ),
+        omni_kv_config={"connector_config": connector_config},
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            data_parallel_size=1,
+            sequence_parallel_size=sequence_parallel_size,
+            cfg_parallel_size=cfg_parallel_size,
+            ulysses_degree=sequence_parallel_size,
+            ring_degree=1,
+            allgather_degree=allgather_degree,
+        ),
+    )
+    return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dense_mode_ignores_page_native_capability(monkeypatch):
+    runner = _make_page_native_capability_runner(
+        cache_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        model_class_name="UnsupportedPipeline",
+        backend="FLASH_ATTN",
+        connector_type="MooncakeStoreConnector",
+        sequence_parallel_size=2,
+        page_native_pipeline=False,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_omni_platform",
+        SimpleNamespace(is_cuda=lambda: False, device_type="cpu"),
+    )
+
+    runner._validate_page_native_capability()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("connector_type", [None, "SharedMemoryConnector", "SharedMemoryPageAdapter"])
+def test_page_native_capability_accepts_direct_and_shared_memory(monkeypatch, connector_type):
+    runner = _make_page_native_capability_runner(connector_type=connector_type)
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_omni_platform",
+        SimpleNamespace(is_cuda=lambda: True, device_type="cuda"),
+    )
+
+    runner._validate_page_native_capability()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("overrides", "platform", "reason"),
+    [
+        ({"model_class_name": "OtherPipeline"}, "cuda", "HunyuanImage3"),
+        ({"page_native_pipeline": False}, "cuda", "pipeline"),
+        ({"backend": "FLASH_ATTN"}, "cuda", "TORCH_SDPA"),
+        ({}, "cpu", "CUDA"),
+        ({"connector_type": "MooncakeStoreConnector"}, "cuda", "connector"),
+        ({"sequence_parallel_size": 2}, "cuda", "sequence"),
+        ({"allgather_degree": 2}, "cuda", "AllGather"),
+        ({"cfg_parallel_size": 2}, "cuda", "CFG"),
+    ],
+)
+def test_page_native_capability_rejects_unsupported_startup(
+    monkeypatch,
+    overrides,
+    platform,
+    reason,
+):
+    runner = _make_page_native_capability_runner(**overrides)
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_omni_platform",
+        SimpleNamespace(
+            is_cuda=lambda: platform == "cuda",
+            device_type=platform,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"paged_scheduler is unsupported for model=.*backend=.*platform={platform}, "
+            rf"connector=.*topology=.*: .*{reason}"
+        ),
+    ):
+        runner._validate_page_native_capability()
 
 
 def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
@@ -848,6 +959,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     runner.pipeline = None
     runner.cache_backend = None
     runner.offload_backend = None
+    runner._validate_page_native_capability = Mock()
     runner.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -872,6 +984,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 
     DiffusionModelRunner.load_model(runner)
 
+    runner._validate_page_native_capability.assert_called_once_with()
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False

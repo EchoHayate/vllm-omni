@@ -324,6 +324,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
+    supports_page_native_kv: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
