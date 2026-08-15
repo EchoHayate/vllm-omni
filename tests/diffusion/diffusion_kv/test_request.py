@@ -44,6 +44,7 @@ def test_request_exposes_native_request_and_diffusion_semantics() -> None:
     assert request.num_computed_tokens == 0
     assert request.block_hashes == []
     assert request.kv_contexts == ()
+    assert request.imported_prefix_token_count == 0
     assert request.skip_reading_prefix_cache is True
     assert request.shared_prefix_boundary == 0
     assert request.status is RequestStatus.WAITING
@@ -57,11 +58,19 @@ def test_request_exposes_native_request_and_diffusion_semantics() -> None:
         ({"target_len": 0}, "target_len"),
         ({"seq_len": 0}, "seq_len"),
         ({"prefix_len": 5, "target_len": 4, "seq_len": 8}, "must not exceed"),
+        ({"imported_prefix_token_count": -1}, "imported_prefix_token_count"),
+        ({"imported_prefix_token_count": 5}, "must not exceed prefix_len"),
     ],
 )
 def test_request_rejects_invalid_lengths(overrides, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         _request(**overrides)
+
+
+def test_request_records_complete_imported_prefix_length() -> None:
+    request = _request(imported_prefix_token_count=4)
+
+    assert request.imported_prefix_token_count == 4
 
 
 @pytest.mark.parametrize(

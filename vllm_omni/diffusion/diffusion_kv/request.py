@@ -62,6 +62,7 @@ class DiffusionKVRequest:
         prefix_len: int,
         target_len: int,
         seq_len: int,
+        imported_prefix_token_count: int = 0,
         block_hashes: Sequence[BlockHash] = (),
         kv_contexts: Sequence[DiffusionKVContext] = (),
     ) -> None:
@@ -80,6 +81,14 @@ class DiffusionKVRequest:
                 "prefix_len + target_len must not exceed seq_len: "
                 f"prefix_len={prefix_len}, target_len={target_len}, seq_len={seq_len}"
             )
+        if imported_prefix_token_count < 0:
+            raise ValueError(f"imported_prefix_token_count must be non-negative, got {imported_prefix_token_count}")
+        if imported_prefix_token_count > prefix_len:
+            raise ValueError(
+                "imported_prefix_token_count must not exceed prefix_len: "
+                f"imported_prefix_token_count={imported_prefix_token_count}, "
+                f"prefix_len={prefix_len}"
+            )
 
         contexts = tuple(kv_contexts)
         if any(not isinstance(context, DiffusionKVContext) for context in contexts):
@@ -92,6 +101,7 @@ class DiffusionKVRequest:
         self.sequence_id = sequence_id
         self.prefix_len = prefix_len
         self.target_len = target_len
+        self.imported_prefix_token_count = imported_prefix_token_count
         self.kv_contexts = contexts
 
         # Native vLLM Request surface. Keep this list intentionally small and

@@ -73,6 +73,53 @@ def test_reserve_and_free_multi_cfg_request() -> None:
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
+def test_manager_emits_stable_and_dynamic_page_ranges() -> None:
+    manager = _manager(8)
+    metadata = manager.reserve_request("public", (_request("public", 0),))
+
+    assert metadata is not None
+    sequence = metadata.sequences[0]
+    assert [(item.token_start, item.token_count, item.mutable) for item in sequence.page_ranges] == [
+        (0, 4, False),
+        (4, 4, True),
+    ]
+    assert sequence.page_ranges[0].block_ids == (sequence.block_ids[0][0],)
+    assert sequence.page_ranges[1].block_ids == (sequence.block_ids[0][1],)
+
+
+def test_partial_stable_page_is_allocated_but_not_publication_eligible() -> None:
+    manager = _manager(8)
+    request = DiffusionKVRequest(
+        "public/diffusion-kv/0",
+        sequence_id=0,
+        prefix_len=6,
+        target_len=2,
+        seq_len=8,
+    )
+
+    metadata = manager.reserve_request("public", (request,))
+
+    assert metadata is not None
+    sequence = metadata.sequences[0]
+    assert sequence.page_ranges[0].block_ids == tuple(sequence.block_ids[0][:2])
+    assert sequence.cacheable_prefix_block_count == 1
+
+
+def test_imported_prefix_must_end_on_a_complete_page() -> None:
+    manager = _manager(8)
+    request = DiffusionKVRequest(
+        "req/diffusion-kv/0",
+        sequence_id=0,
+        prefix_len=8,
+        target_len=4,
+        seq_len=12,
+        imported_prefix_token_count=6,
+    )
+
+    with pytest.raises(DiffusionKVAdmissionError, match="complete cache blocks"):
+        manager.reserve_request("req", (request,))
+
+
 def test_impossible_cfg_allocation_rolls_back_and_fails_fast() -> None:
     manager = _manager(3)
     free_before = manager.native_manager.block_pool.get_num_free_blocks()

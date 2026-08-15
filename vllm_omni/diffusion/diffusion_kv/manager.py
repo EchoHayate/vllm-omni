@@ -12,6 +12,7 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
 )
+from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageRange
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
@@ -48,6 +49,7 @@ class DiffusionKVCacheManager:
             enable_caching=False,
         )
         self.max_model_len = max_model_len
+        self.scheduler_block_size = scheduler_block_size
         # Native vLLM may reserve a null block, so an idle BlockPool does not
         # necessarily report ``kv_cache_config.num_blocks`` free blocks.
         self._empty_pool_num_free_blocks = self.native_manager.block_pool.get_num_free_blocks()
@@ -121,6 +123,12 @@ class DiffusionKVCacheManager:
                     f"Diffusion KV sequence {request.request_id!r} exceeds max_model_len: "
                     f"seq_len={request.seq_len}, max_model_len={self.max_model_len}"
                 )
+            if request.imported_prefix_token_count % self.scheduler_block_size:
+                raise DiffusionKVAdmissionError(
+                    "imported_prefix_token_count must cover complete cache blocks: "
+                    f"imported_prefix_token_count={request.imported_prefix_token_count}, "
+                    f"block_size={self.scheduler_block_size}"
+                )
 
         required_blocks = self._get_empty_pool_required_blocks(requests)
         if required_blocks > self._empty_pool_num_free_blocks:
@@ -145,13 +153,39 @@ class DiffusionKVCacheManager:
                     allocated.clear()
                     return None
                 allocated.append(request)
+                block_ids = blocks.get_block_ids()
+                group_block_ids = tuple(block_ids[0])
+                stable_block_count = (request.prefix_len + self.scheduler_block_size - 1) // self.scheduler_block_size
+                dynamic_end = request.prefix_len + request.target_len
+                dynamic_block_count = (dynamic_end + self.scheduler_block_size - 1) // self.scheduler_block_size
+                stable_ids = group_block_ids[:stable_block_count]
+                dynamic_ids = group_block_ids[request.prefix_len // self.scheduler_block_size : dynamic_block_count]
+                page_ranges = (
+                    DiffusionPageRange(
+                        cache_role="primary",
+                        token_start=0,
+                        token_count=request.prefix_len,
+                        block_ids=stable_ids,
+                        mutable=False,
+                    ),
+                    DiffusionPageRange(
+                        cache_role="primary",
+                        token_start=request.prefix_len,
+                        token_count=request.target_len,
+                        block_ids=dynamic_ids,
+                        mutable=True,
+                    ),
+                )
                 sequence_metadata.append(
                     DiffusionKVSequenceMetadata(
                         sequence_id=request.sequence_id,
                         prefix_len=request.prefix_len,
                         target_len=request.target_len,
                         seq_len=request.seq_len,
-                        block_ids=blocks.get_block_ids(),
+                        block_ids=block_ids,
+                        page_ranges=page_ranges,
+                        cacheable_prefix_block_count=request.prefix_len // self.scheduler_block_size,
+                        imported_prefix_token_count=request.imported_prefix_token_count,
                     )
                 )
         except Exception:

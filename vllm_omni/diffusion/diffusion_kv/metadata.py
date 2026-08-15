@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageRange
+
 
 @dataclass
 class DiffusionKVContextMetadata:
@@ -41,6 +43,9 @@ class DiffusionKVSequenceMetadata:
     seq_len: int
     block_ids: tuple[list[int], ...]
     context_ids: tuple[str, ...] = ()
+    page_ranges: tuple[DiffusionPageRange, ...] = ()
+    cacheable_prefix_block_count: int = 0
+    imported_prefix_token_count: int = 0
 
 
 @dataclass

@@ -8,6 +8,7 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
 )
+from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageRange
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,6 +37,27 @@ def test_diffusion_kv_metadata_uses_native_cache_group_block_ids() -> None:
 
     assert metadata.sequences[0].block_ids == ([1, 2], [5, 6])
     assert metadata.contexts[0].block_ids == ([7], [11])
+
+
+def test_sequence_metadata_carries_page_ranges_and_import_boundary() -> None:
+    page_ranges = (
+        DiffusionPageRange("primary", 0, 8, (3, 5), mutable=False),
+        DiffusionPageRange("primary", 8, 4, (7,), mutable=True),
+    )
+    sequence = DiffusionKVSequenceMetadata(
+        sequence_id=0,
+        prefix_len=8,
+        target_len=4,
+        seq_len=12,
+        block_ids=([3, 5, 7],),
+        page_ranges=page_ranges,
+        cacheable_prefix_block_count=2,
+        imported_prefix_token_count=4,
+    )
+
+    assert sequence.page_ranges == page_ranges
+    assert sequence.cacheable_prefix_block_count == 2
+    assert sequence.imported_prefix_token_count == 4
 
 
 def test_cfg_sequences_can_share_one_request_context() -> None:
