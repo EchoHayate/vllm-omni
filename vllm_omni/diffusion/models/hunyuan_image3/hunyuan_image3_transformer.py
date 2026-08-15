@@ -1238,7 +1238,11 @@ class ImageKVCacheManager(nn.Module):
                         locally_produced,
                         _record_page_write_event(layer_cache),
                     )
-            gathered_key, gathered_value = gather_hunyuan_kv_reference(layer_cache, batch)
+            gathered_key, gathered_value = gather_hunyuan_kv_reference(
+                layer_cache,
+                batch,
+                metrics=context.diffusion_page_metrics,
+            )
             gathered_keys.append(gathered_key)
             gathered_values.append(gathered_value)
 

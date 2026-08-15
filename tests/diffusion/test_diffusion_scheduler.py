@@ -96,6 +96,8 @@ def _initialize_paged_scheduler(
     num_blocks: int = 64,
     max_num_seqs: int = 1,
     tp_size: int = 1,
+    dp_size: int = 1,
+    enable_expert_parallel: bool = False,
 ) -> None:
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(
@@ -114,7 +116,11 @@ def _initialize_paged_scheduler(
             diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
             max_model_len=64,
             max_num_seqs=max_num_seqs,
-            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=tp_size,
+                data_parallel_size=dp_size,
+                enable_expert_parallel=enable_expert_parallel,
+            ),
         ),
         kv_cache_config=config,
         scheduler_block_size=4,
@@ -654,6 +660,48 @@ class TestRequestScheduler:
         assert compute.scheduled_request_ids == ["first"]
         assert compute.num_running_reqs == 1
         assert compute.num_waiting_reqs == 1
+
+    def test_paged_scheduler_assigns_independent_dp_replica_ownership(
+        self,
+    ) -> None:
+        _initialize_paged_scheduler(
+            self.scheduler,
+            max_num_seqs=2,
+            tp_size=2,
+            dp_size=2,
+            enable_expert_parallel=False,
+        )
+        first = _make_request("first")
+        second = _make_request("second")
+        _attach_diffusion_kv(first)
+        _attach_diffusion_kv(second)
+        self.scheduler.add_request(first)
+        self.scheduler.add_request(second)
+
+        allocation = self.scheduler.schedule()
+
+        assert [(install.request_id, install.data_parallel_rank) for install in allocation.page_install_reqs] == [
+            ("first", 0),
+            ("second", 1),
+        ]
+        for install in allocation.page_install_reqs:
+            for tp_rank in range(2):
+                self.scheduler.update_worker_kv(
+                    scheduler_interface.WorkerKVUpdate(
+                        install.request_id,
+                        install.allocation_generation,
+                        tp_rank=tp_rank,
+                        status="ready",
+                        data_parallel_rank=install.data_parallel_rank,
+                    )
+                )
+
+        compute = self.scheduler.schedule()
+
+        assert [(new_req.request_id, new_req.data_parallel_rank) for new_req in compute.scheduled_new_reqs] == [
+            ("first", 0),
+            ("second", 1),
+        ]
 
     def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)

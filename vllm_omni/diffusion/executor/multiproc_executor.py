@@ -21,6 +21,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
@@ -465,6 +466,61 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
+
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
+        independent_paged_dp = (
+            bool(new_reqs)
+            and dp_size > 1
+            and getattr(
+                self.od_config,
+                "diffusion_kv_mode",
+                DiffusionKVCacheMode.DENSE_LEGACY,
+            )
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and not getattr(parallel_config, "enable_expert_parallel", False)
+        )
+        if independent_paged_dp:
+            try:
+                results = self.collective_rpc(
+                    "execute_model",
+                    timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                    args=(new_reqs, self.od_config, scheduler_output.kv_prefetch_job),
+                    unique_reply_rank=None,
+                    exec_all_ranks=True,
+                )
+                results = results if isinstance(results, list) else [results]
+                active_results = [result for result in results if result is not None]
+                if len(active_results) != len(new_reqs):
+                    raise RuntimeError(
+                        "Paged DP returned an unexpected number of active "
+                        f"results: expected {len(new_reqs)}, got {len(active_results)}"
+                    )
+                for new_req, result in zip(new_reqs, active_results, strict=True):
+                    if not isinstance(result, DiffusionOutput):
+                        raise RuntimeError(f"Unexpected paged DP response type: {type(result)!r}")
+                    runner_outputs.append(
+                        RunnerOutput(
+                            request_id=new_req.request_id,
+                            step_index=None,
+                            finished=True,
+                            result=result,
+                        )
+                    )
+            except Exception as exc:
+                for new_req in new_reqs:
+                    runner_outputs.append(
+                        RunnerOutput(
+                            request_id=new_req.request_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput(error=str(exc)),
+                        )
+                    )
+            return BatchRunnerOutput.from_list(
+                runner_outputs,
+                worker_kv_updates=worker_kv_updates,
+            )
 
         # DP multi-concurrency: when DLO+AllGather is active and multiple
         # requests are scheduled, send every complete NewRequestData envelope

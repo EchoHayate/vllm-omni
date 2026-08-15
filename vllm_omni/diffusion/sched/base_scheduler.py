@@ -58,6 +58,8 @@ class BaseScheduler(ABC):
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
         self._diffusion_kv_tp_size: int = 1
+        self._diffusion_kv_dp_size: int = 1
+        self._diffusion_kv_independent_dp: bool = False
         self._pending_kv_releases: dict[tuple[str, int], set[int]] = {}
 
     def initialize(
@@ -107,6 +109,17 @@ class BaseScheduler(ABC):
                 1,
                 int(getattr(parallel_config, "tensor_parallel_size", 1)),
             )
+            self._diffusion_kv_dp_size = max(
+                1,
+                int(getattr(parallel_config, "data_parallel_size", 1)),
+            )
+            self._diffusion_kv_independent_dp = self._diffusion_kv_dp_size > 1 and not bool(
+                getattr(
+                    parallel_config,
+                    "enable_expert_parallel",
+                    False,
+                )
+            )
         else:
             if any(
                 value is not None
@@ -120,6 +133,8 @@ class BaseScheduler(ABC):
                 raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
             self._diffusion_kv_manager = None
             self._diffusion_kv_tp_size = 1
+            self._diffusion_kv_dp_size = 1
+            self._diffusion_kv_independent_dp = False
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -216,6 +231,29 @@ class BaseScheduler(ABC):
             state = self._request_states.get(request_id)
             if state is None or state.is_finished() or state.kv_readiness is not DiffusionKVReadiness.UNALLOCATED:
                 continue
+            if self._diffusion_kv_independent_dp and state.data_parallel_rank is None:
+                occupied_ranks = {
+                    other.data_parallel_rank
+                    for other in self._request_states.values()
+                    if other.data_parallel_rank is not None
+                    and (
+                        not other.is_finished()
+                        or (
+                            other.allocation_generation is not None
+                            and (
+                                other.request_id,
+                                other.allocation_generation,
+                            )
+                            in self._pending_kv_releases
+                        )
+                    )
+                }
+                state.data_parallel_rank = next(
+                    (rank for rank in range(self._diffusion_kv_dp_size) if rank not in occupied_ranks),
+                    None,
+                )
+                if state.data_parallel_rank is None:
+                    continue
             try:
                 metadata = self._diffusion_kv_manager.reserve_request(
                     request_id,
@@ -244,6 +282,7 @@ class BaseScheduler(ABC):
                 request_id=request_id,
                 allocation_generation=state.allocation_generation,
                 metadata=self._diffusion_kv_manager.get_metadata(request_id),
+                data_parallel_rank=state.data_parallel_rank,
             )
             for request_id in self._waiting
             if (state := self._request_states.get(request_id)) is not None
@@ -299,6 +338,13 @@ class BaseScheduler(ABC):
                 "Diffusion KV update tp_rank is outside the active TP group: "
                 f"tp_rank={update.tp_rank}, tp_size={self._diffusion_kv_tp_size}"
             )
+        state = self._request_states.get(update.request_id)
+        if (
+            state is not None
+            and state.data_parallel_rank is not None
+            and update.data_parallel_rank != state.data_parallel_rank
+        ):
+            return
         if update.status == "released":
             release_key = (
                 update.request_id,
@@ -312,9 +358,10 @@ class BaseScheduler(ABC):
                 if self._diffusion_kv_manager is not None:
                     self._diffusion_kv_manager.free_request(update.request_id)
                 self._pending_kv_releases.pop(release_key, None)
+                if state is not None:
+                    state.data_parallel_rank = None
             return
 
-        state = self._request_states.get(update.request_id)
         if state is None or state.allocation_generation is None:
             return
         if update.allocation_generation != state.allocation_generation:
@@ -354,6 +401,9 @@ class BaseScheduler(ABC):
             PageReleaseRequest(
                 request_id=request_id,
                 allocation_generation=allocation_generation,
+                data_parallel_rank=(
+                    self._request_states[request_id].data_parallel_rank if request_id in self._request_states else None
+                ),
             )
             for request_id, allocation_generation in self._pending_kv_releases
         ]
@@ -437,6 +487,8 @@ class BaseScheduler(ABC):
             self._diffusion_kv_manager.close()
             self._diffusion_kv_manager = None
         self._diffusion_kv_tp_size = 1
+        self._diffusion_kv_dp_size = 1
+        self._diffusion_kv_independent_dp = False
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()

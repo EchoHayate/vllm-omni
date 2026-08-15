@@ -494,6 +494,30 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
+    def get_diffusion_page_debug_snapshots(self) -> list[dict[str, object]]:
+        assert self.model_runner is not None, "Model runner not initialized"
+
+        def local_snapshot() -> dict[str, object]:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_data_parallel_rank,
+            )
+
+            return {
+                "rank": self.rank,
+                "data_parallel_rank": get_data_parallel_rank(),
+                "tensor_parallel_rank": get_tensor_model_parallel_rank(),
+                **self.model_runner.get_diffusion_page_debug_snapshot(),
+            }
+
+        return _run_and_gather_rank_values(
+            "diffusion page debug snapshot",
+            local_snapshot,
+        )
+
     def _run_ar_diffusion_session_lifecycle(self, method: str, session_id: str) -> bool:
         """Delegate an optional AR session lifecycle call to the model runner."""
         if not isinstance(session_id, str) or not session_id.strip():
@@ -542,8 +566,15 @@ class DiffusionWorker:
             from vllm_omni.diffusion.distributed.parallel_state import get_data_parallel_rank
 
             dp_rank = get_data_parallel_rank()
-            idx = dp_rank % len(req)
-            new_req = req[idx]
+            assigned = [new_req for new_req in req if new_req.data_parallel_rank == dp_rank]
+            has_explicit_assignments = any(new_req.data_parallel_rank is not None for new_req in req)
+            if has_explicit_assignments and not assigned:
+                return {
+                    "dp_rank": dp_rank,
+                    "output": None,
+                    "idle": True,
+                }
+            new_req = assigned[0] if assigned else req[dp_rank % len(req)]
             validate_new_request_data_identity(new_req)
             req = new_req.req
             diffusion_kv_metadata = new_req.diffusion_kv_metadata

@@ -24,9 +24,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 class FakeEvent:
     def __init__(self, complete: bool = True) -> None:
         self.complete = complete
+        self.synchronized = False
 
     def query(self) -> bool:
         return self.complete
+
+    def synchronize(self) -> None:
+        self.synchronized = True
+        self.complete = True
+
+
+class FakeStream:
+    def __init__(self) -> None:
+        self.recorded_events: list[object] = []
+
+    def record_event(self, event: object) -> None:
+        self.recorded_events.append(event)
 
 
 class FakeClock:
@@ -128,6 +141,20 @@ def test_direct_copy_commits_only_after_event_completion() -> None:
     assert result is not None
     assert result.status == "completed"
     assert binding.is_compute_ready
+
+
+def test_completion_event_is_recorded_on_the_copy_stream() -> None:
+    event = FakeEvent(complete=False)
+    copy_stream = FakeStream()
+    manager, _, plan, _, _ = _direct_manager(event=event)
+
+    recorded = manager._record_completion_event(
+        plan,
+        copy_stream=copy_stream,
+    )
+
+    assert recorded is event
+    assert copy_stream.recorded_events == [event]
 
 
 def test_completed_transfer_reports_lifecycle_metrics_and_terminal_snapshot() -> None:
@@ -268,6 +295,18 @@ def test_cancellation_is_terminal_in_every_nonterminal_state(state: str) -> None
 
     assert result.status == "cancelled"
     assert manager.poll_completion(handle) == result
+    assert not binding.is_compute_ready
+
+
+def test_close_waits_for_in_flight_copy_before_cancelling() -> None:
+    event = FakeEvent(complete=False)
+    manager, binding, plan, _, _ = _direct_manager(event=event)
+    handle = manager.send_pages(plan, manager.prepare_receive(plan))
+
+    manager.close()
+
+    assert event.synchronized
+    assert manager.state(handle) is TransferState.CANCELLED
     assert not binding.is_compute_ready
 
 

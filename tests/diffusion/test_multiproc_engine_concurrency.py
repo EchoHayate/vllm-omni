@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 import torch
@@ -16,6 +16,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -299,6 +300,41 @@ class TestRequestModeDispatch:
         thread.join(timeout=2)
 
         assert [result.error for result in results] == ["0", "1"]
+
+    def test_paged_dp_single_request_dispatches_only_one_active_replica(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=True,
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                enable_expert_parallel=False,
+            ),
+        )
+        executor.collective_rpc = Mock(
+            return_value=[
+                _tagged_output("active"),
+                None,
+            ]
+        )
+        scheduler_output = _make_sched_output("A")
+        scheduler_output.scheduled_new_reqs[0].data_parallel_rank = 0
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.request_id for output in result.runner_outputs] == ["A"]
+        assert [output.result.error for output in result.runner_outputs] == ["active"]
+        executor.collective_rpc.assert_called_once_with(
+            "execute_model",
+            timeout=ANY,
+            args=(
+                scheduler_output.scheduled_new_reqs,
+                executor.od_config,
+                scheduler_output.kv_prefetch_job,
+            ),
+            unique_reply_rank=None,
+            exec_all_ranks=True,
+        )
 
     @pytest.mark.parametrize(
         ("tp_size", "sp_size", "pp_size", "cfg_size", "expected_primary_ranks"),

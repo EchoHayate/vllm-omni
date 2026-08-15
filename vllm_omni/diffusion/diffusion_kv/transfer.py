@@ -167,6 +167,7 @@ class PageTransferSessionManager:
         self._endpoints: dict[PageEndpoint, torch.Tensor] = {}
         self._sessions: dict[TransferIdentity, _TransferSession] = {}
         self._session_identities: dict[str, set[TransferIdentity]] = {}
+        self._copy_streams: dict[torch.device, torch.cuda.Stream] = {}
 
     def register_binding(self, binding: DiffusionPageBinding) -> None:
         self._bindings[binding.request_id] = binding
@@ -262,6 +263,7 @@ class PageTransferSessionManager:
             )
         session.in_flight_bytes = self._plan_num_bytes(plan)
         self.metrics.add_in_flight_bytes(session.in_flight_bytes)
+        copy_stream = None
         try:
             for page_copy in plan.pages:
                 self._validate_copy_geometry(page_copy)
@@ -275,8 +277,15 @@ class PageTransferSessionManager:
                     raise KeyError(f"missing destination endpoint registration: {page_copy.destination!r}") from exc
                 if self._tensors_overlap(source, destination):
                     raise ValueError("source and destination page spans overlap")
-                self._copy_tensor(destination, source)
-            session.event = self._record_completion_event(plan)
+                page_copy_stream = self._copy_tensor(destination, source)
+                if page_copy_stream is not None:
+                    if copy_stream is not None and page_copy_stream is not copy_stream:
+                        raise ValueError("one page transfer plan must target a single CUDA device")
+                    copy_stream = page_copy_stream
+            session.event = self._record_completion_event(
+                plan,
+                copy_stream=copy_stream,
+            )
         except Exception as exc:
             self._set_terminal(
                 session,
@@ -349,6 +358,7 @@ class PageTransferSessionManager:
         if session.result is not None:
             self.metrics.duplicate_completions += 1
             return session.result
+        self._wait_for_copy_completion(session)
         return self._set_terminal(session, TransferState.CANCELLED)
 
     def record_reference_gather(
@@ -357,24 +367,23 @@ class PageTransferSessionManager:
         num_bytes: int,
         latency_s: float,
     ) -> None:
-        if num_bytes < 0:
-            raise ValueError(f"reference gather bytes must be non-negative, got {num_bytes}")
-        if latency_s < 0:
-            raise ValueError(f"reference gather latency must be non-negative, got {latency_s}")
-        self.metrics.reference_gather_bytes += num_bytes
-        self.metrics.reference_gather_latency_s += latency_s
+        self.metrics.record_reference_gather(
+            num_bytes=num_bytes,
+            latency_s=latency_s,
+        )
 
     def close_session(self, session_id: str) -> None:
         for identity in tuple(self._session_identities.get(session_id, ())):
             session = self._sessions[identity]
             if session.result is None:
-                self._set_terminal(session, TransferState.CANCELLED)
+                self.cancel(identity)
 
     def close(self) -> None:
         for session_id in tuple(self._session_identities):
             self.close_session(session_id)
         self._endpoints.clear()
         self._bindings.clear()
+        self._copy_streams.clear()
 
     def state(
         self,
@@ -539,25 +548,54 @@ class PageTransferSessionManager:
         if mismatches:
             raise ValueError(f"endpoint tensor geometry mismatch: {mismatches}")
 
-    def _copy_tensor(self, destination: torch.Tensor, source: torch.Tensor) -> None:
+    def _copy_tensor(
+        self,
+        destination: torch.Tensor,
+        source: torch.Tensor,
+    ) -> torch.cuda.Stream | None:
         if self._copy_fn is not None:
             self._copy_fn(destination, source)
-            return
+            return None
         if source.device.type == "cuda":
-            stream = torch.cuda.Stream(device=destination.device)
+            device = torch.device(destination.device)
+            stream = self._copy_streams.get(device)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self._copy_streams[device] = stream
+            stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(stream):
                 destination.copy_(source, non_blocking=True)
-            return
+                source.record_stream(stream)
+                destination.record_stream(stream)
+            return stream
         destination.copy_(source)
+        return None
 
-    def _record_completion_event(self, plan: PageTransferPlan):
+    def _record_completion_event(
+        self,
+        plan: PageTransferPlan,
+        *,
+        copy_stream=None,
+    ):
         if self._event_factory is not None:
-            return self._event_factory()
-        if any(page_copy.destination.device_type == "cuda" for page_copy in plan.pages):
+            event = self._event_factory()
+        elif any(page_copy.destination.device_type == "cuda" for page_copy in plan.pages):
             event = torch.cuda.Event()
+        else:
+            return _ImmediateEvent()
+        if copy_stream is not None:
+            copy_stream.record_event(event)
+        elif any(page_copy.destination.device_type == "cuda" for page_copy in plan.pages):
             torch.cuda.current_stream().record_event(event)
-            return event
-        return _ImmediateEvent()
+        return event
+
+    @staticmethod
+    def _wait_for_copy_completion(session: _TransferSession) -> None:
+        if session.state is not TransferState.TRANSFERRING or session.event is None:
+            return
+        synchronize = getattr(session.event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
 
     @staticmethod
     def _tensors_overlap(source: torch.Tensor, destination: torch.Tensor) -> bool:

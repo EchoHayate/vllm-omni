@@ -9,7 +9,7 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 import vllm_omni.diffusion.worker.diffusion_worker as worker_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
@@ -195,15 +195,27 @@ def test_request_rpc_rejects_envelope_request_identity_mismatch() -> None:
 def test_executor_runs_page_control_on_all_ranks_without_model_request() -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = SimpleNamespace(
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         enable_distributed_layerwise_offload=False,
         dlo_use_allgather=True,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            enable_expert_parallel=False,
+        ),
     )
     executor._ensure_open = lambda: None
     update_rank0 = WorkerKVUpdate("req", 1, tp_rank=0, status="ready")
     update_rank1 = WorkerKVUpdate("req", 1, tp_rank=1, status="ready")
     calls = []
 
-    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+    def collective_rpc(
+        method,
+        *,
+        args,
+        unique_reply_rank,
+        exec_all_ranks,
+        timeout=None,
+    ):
         calls.append((method, args, unique_reply_rank, exec_all_ranks))
         return [[update_rank0], [update_rank1]]
 
@@ -421,6 +433,40 @@ def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch)
     assert result["dp_rank"] == 1
 
 
+def test_paged_dp_worker_stays_idle_without_assigned_envelope(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    class ModelRunner:
+        def execute_model(self, req, **kwargs):
+            calls.append((req, kwargs))
+            return DiffusionOutput(output=None)
+
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = ModelRunner()
+    worker.lora_manager = None
+    worker._get_profiler = lambda: None
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank",
+        lambda: 1,
+    )
+    req = SimpleNamespace(request_id="req-0")
+    envelope = NewRequestData(
+        request_id="req-0",
+        req=req,
+        diffusion_kv_metadata=make_metadata("req-0"),
+        data_parallel_rank=0,
+    )
+
+    result = worker.execute_model([envelope], SimpleNamespace())
+
+    assert calls == []
+    assert result == {
+        "dp_rank": 1,
+        "output": None,
+        "idle": True,
+    }
+
+
 def test_set_kv_cache_config_initializes_registry_only_in_paged_mode(monkeypatch) -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
     runner.get_kv_cache_spec = Mock(return_value={"layer0": object()})
@@ -613,6 +659,45 @@ def test_page_control_installs_ready_binding_and_reports_rank_update() -> None:
     assert runner._diffusion_page_bindings == {"req": binding}
 
 
+def test_page_control_skips_binding_owned_by_another_dp_replica(
+    monkeypatch,
+) -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.page_registry = SimpleNamespace(
+        bind_request=Mock(),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        register_binding=Mock(),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank",
+        lambda: 1,
+    )
+
+    updates = runner._process_diffusion_page_control(
+        make_scheduler_output(
+            page_installs=(
+                PageInstallRequest(
+                    request_id="req",
+                    allocation_generation=1,
+                    metadata=make_metadata("req"),
+                    data_parallel_rank=0,
+                ),
+            )
+        )
+    )
+
+    assert updates == []
+    assert runner._diffusion_page_bindings == {}
+    runner.page_registry.bind_request.assert_not_called()
+    runner.page_transfer_manager.register_binding.assert_not_called()
+
+
 def test_page_control_reports_release_after_worker_binding_cleanup() -> None:
     calls = []
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
@@ -800,6 +885,184 @@ def test_shutdown_cancels_transfer_sessions_before_releasing_pages() -> None:
     assert runner.page_registry is None
 
 
+def test_page_debug_snapshot_copies_metrics_and_active_binding_identity() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    metrics = DiffusionPageMetrics(
+        stable_pages_requested=3,
+        stable_pages_imported=2,
+        stable_pages_committed=2,
+        transferred_bytes=4096,
+        reference_gather_bytes=8192,
+        terminal_snapshots=[
+            {
+                "request_id": "done",
+                "allocation_generation": 5,
+                "page_count": 2,
+                "transferred_bytes": 4096,
+            }
+        ],
+    )
+    runner.page_registry = SimpleNamespace(metrics=metrics)
+    runner.page_transfer_manager = SimpleNamespace()
+    runner._diffusion_page_bindings["active"] = SimpleNamespace(
+        request_id="active",
+        allocation_generation=7,
+    )
+
+    snapshot = runner.get_diffusion_page_debug_snapshot()
+
+    assert snapshot == {
+        "enabled": True,
+        "metrics": {
+            "stable_pages_requested": 3,
+            "stable_pages_imported": 2,
+            "stable_pages_committed": 2,
+            "transferred_bytes": 4096,
+            "local_install_latency_s": 0.0,
+            "local_kv_wait_s": 0.0,
+            "stale_completions": 0,
+            "duplicate_completions": 0,
+            "cancellations": 0,
+            "timeouts": 0,
+            "page_pool_pages_in_use": 0,
+            "page_pool_total_pages": 0,
+            "page_pool_utilization": 0.0,
+            "page_pool_utilization_high_water": 0.0,
+            "staging_bytes": 0,
+            "staging_bytes_high_water": 0,
+            "in_flight_bytes": 0,
+            "in_flight_bytes_high_water": 0,
+            "reference_gather_bytes": 8192,
+            "reference_gather_latency_s": 0.0,
+            "terminal_snapshots": [
+                {
+                    "request_id": "done",
+                    "allocation_generation": 5,
+                    "page_count": 2,
+                    "transferred_bytes": 4096,
+                }
+            ],
+        },
+        "active_bindings": [
+            {
+                "request_id": "active",
+                "allocation_generation": 7,
+            }
+        ],
+    }
+    snapshot["metrics"]["terminal_snapshots"][0]["page_count"] = 99
+    assert metrics.terminal_snapshots[0]["page_count"] == 2
+
+
+def test_release_records_terminal_binding_snapshot_before_cleanup() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    metrics = DiffusionPageMetrics()
+    runner.page_registry = SimpleNamespace(
+        metrics=metrics,
+        release_request=Mock(),
+    )
+    runner.page_transfer_manager = SimpleNamespace(
+        unregister_binding=Mock(),
+    )
+    runner._diffusion_page_bindings["req"] = SimpleNamespace(
+        request_id="req",
+        allocation_generation=9,
+        page_states={3: object(), 5: object()},
+    )
+
+    runner.release_diffusion_kv_requests({"req"})
+
+    assert metrics.terminal_snapshots[-1] == {
+        "request_id": "req",
+        "allocation_generation": 9,
+        "page_count": 2,
+        "transferred_bytes": 0,
+        "terminal_status": "released",
+    }
+    assert runner._diffusion_page_bindings == {}
+
+
+def test_dense_page_debug_snapshot_is_disabled_without_metrics() -> None:
+    runner = make_runner(DiffusionKVCacheMode.DENSE_LEGACY)
+
+    assert runner.get_diffusion_page_debug_snapshot() == {
+        "enabled": False,
+        "metrics": None,
+        "active_bindings": [],
+    }
+
+
+def test_worker_page_debug_snapshot_gathers_every_rank(monkeypatch) -> None:
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 3
+    worker.model_runner = SimpleNamespace(
+        get_diffusion_page_debug_snapshot=lambda: {
+            "enabled": True,
+            "metrics": {"stable_pages_committed": 2},
+            "active_bindings": [],
+        }
+    )
+    gathered = [
+        {
+            "rank": 3,
+            "enabled": True,
+            "metrics": {"stable_pages_committed": 2},
+            "active_bindings": [],
+        },
+        {
+            "rank": 4,
+            "enabled": True,
+            "metrics": {"stable_pages_committed": 2},
+            "active_bindings": [],
+        },
+    ]
+    monkeypatch.setattr(
+        worker_module,
+        "_run_and_gather_rank_values",
+        lambda operation, func: gathered if operation == "diffusion page debug snapshot" else func(),
+    )
+
+    assert worker.get_diffusion_page_debug_snapshots() == gathered
+
+
+def test_worker_page_debug_snapshot_reports_parallel_coordinates(
+    monkeypatch,
+) -> None:
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 3
+    worker.model_runner = SimpleNamespace(
+        get_diffusion_page_debug_snapshot=lambda: {
+            "enabled": True,
+            "metrics": {"stable_pages_committed": 2},
+            "active_bindings": [],
+        }
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_run_and_gather_rank_values",
+        lambda operation, func: [func()],
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+        lambda: 1,
+    )
+
+    assert worker.get_diffusion_page_debug_snapshots() == [
+        {
+            "rank": 3,
+            "data_parallel_rank": 1,
+            "tensor_parallel_rank": 1,
+            "enabled": True,
+            "metrics": {"stable_pages_committed": 2},
+            "active_bindings": [],
+        }
+    ]
+
+
 def test_worker_shutdown_closes_page_data_plane_before_legacy_prefetch(
     monkeypatch,
 ) -> None:
@@ -831,3 +1094,10 @@ def test_forward_context_exposes_diffusion_page_bindings() -> None:
 
     with set_forward_context(diffusion_page_bindings={"req": binding}):
         assert get_forward_context().diffusion_page_bindings == {"req": binding}
+
+
+def test_forward_context_exposes_diffusion_page_metrics() -> None:
+    metrics = DiffusionPageMetrics()
+
+    with set_forward_context(diffusion_page_metrics=metrics):
+        assert get_forward_context().diffusion_page_metrics is metrics

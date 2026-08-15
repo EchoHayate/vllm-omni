@@ -23,6 +23,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
+MODEL_REVISION = "2ec2c78bee7d4b94157341fba86c4c2c7b1858b2"
 SEED = 42
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
@@ -68,6 +69,7 @@ _DEPLOY_CONFIG = {
             "gpu_memory_utilization": 0.9,
             "enforce_eager": True,
             "trust_remote_code": True,
+            "revision": MODEL_REVISION,
             "devices": "0,1,2,3",  # set dynamically by _write_deploy_config
             "vae_use_slicing": False,
             "moe_backend": "flashinfer_cutlass",

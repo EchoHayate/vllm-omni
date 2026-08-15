@@ -671,6 +671,19 @@ class DiffusionPageMetrics:
             )
         self.in_flight_bytes -= num_bytes
 
+    def record_reference_gather(
+        self,
+        *,
+        num_bytes: int,
+        latency_s: float,
+    ) -> None:
+        if num_bytes < 0:
+            raise ValueError(f"reference gather bytes must be non-negative, got {num_bytes}")
+        if latency_s < 0:
+            raise ValueError(f"reference gather latency must be non-negative, got {latency_s}")
+        self.reference_gather_bytes += num_bytes
+        self.reference_gather_latency_s += latency_s
+
 
 @dataclass
 class OmniDiffusionConfig:

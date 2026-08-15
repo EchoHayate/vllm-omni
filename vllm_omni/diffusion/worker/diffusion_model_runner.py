@@ -15,6 +15,7 @@ import gc
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -634,6 +635,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             binding = bindings.pop(request_id, None)
             if binding is None:
                 continue
+            metrics = getattr(page_registry, "metrics", None)
+            if metrics is not None:
+                metrics.terminal_snapshots.append(
+                    {
+                        "request_id": request_id,
+                        "allocation_generation": binding.allocation_generation,
+                        "page_count": len(binding.page_states),
+                        "transferred_bytes": 0,
+                        "terminal_status": "released",
+                    }
+                )
             page_transfer_manager.unregister_binding(
                 request_id,
                 binding.allocation_generation,
@@ -642,6 +654,31 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 request_id,
                 binding.allocation_generation,
             )
+
+    def get_diffusion_page_debug_snapshot(self) -> dict[str, object]:
+        page_registry = getattr(self, "page_registry", None)
+        page_transfer_manager = getattr(self, "page_transfer_manager", None)
+        bindings = getattr(self, "_diffusion_page_bindings", {})
+        enabled = page_registry is not None and page_transfer_manager is not None
+        metrics = asdict(page_registry.metrics) if enabled else None
+        active_bindings = [
+            {
+                "request_id": binding.request_id,
+                "allocation_generation": binding.allocation_generation,
+            }
+            for binding in sorted(
+                bindings.values(),
+                key=lambda binding: (
+                    binding.request_id,
+                    binding.allocation_generation,
+                ),
+            )
+        ]
+        return {
+            "enabled": enabled,
+            "metrics": metrics,
+            "active_bindings": active_bindings,
+        }
 
     def _prepare_diffusion_page_bindings(
         self,
@@ -692,9 +729,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_data_parallel_rank,
+        )
+
         tp_rank = get_tensor_model_parallel_rank() if torch.distributed.is_initialized() else 0
+        dp_rank = get_data_parallel_rank() if torch.distributed.is_initialized() else 0
         updates: list[WorkerKVUpdate] = []
         for release_req in scheduler_output.page_release_reqs:
+            if release_req.data_parallel_rank is not None and release_req.data_parallel_rank != dp_rank:
+                continue
             binding = self._diffusion_page_bindings.get(release_req.request_id)
             if binding is not None and binding.allocation_generation == release_req.allocation_generation:
                 self.release_diffusion_kv_requests({release_req.request_id})
@@ -704,10 +748,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     allocation_generation=release_req.allocation_generation,
                     tp_rank=tp_rank,
                     status="released",
+                    data_parallel_rank=release_req.data_parallel_rank,
                 )
             )
 
         for install_req in scheduler_output.page_install_reqs:
+            if install_req.data_parallel_rank is not None and install_req.data_parallel_rank != dp_rank:
+                continue
             try:
                 if (
                     install_req.metadata.request_id != install_req.request_id
@@ -725,6 +772,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             allocation_generation=install_req.allocation_generation,
                             tp_rank=tp_rank,
                             status="ready",
+                            data_parallel_rank=install_req.data_parallel_rank,
                         )
                     )
             except Exception as exc:
@@ -736,6 +784,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         tp_rank=tp_rank,
                         status="failed",
                         error=str(exc),
+                        data_parallel_rank=install_req.data_parallel_rank,
                     )
                 )
         return updates
@@ -955,6 +1004,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=od_config,
                 diffusion_page_bindings=diffusion_page_bindings,
+                diffusion_page_metrics=(
+                    self.page_registry.metrics
+                    if diffusion_page_bindings is not None and self.page_registry is not None
+                    else None
+                ),
             ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)

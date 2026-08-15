@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.page import (
     DiffusionPageBinding,
     DiffusionPageRange,
@@ -414,10 +415,17 @@ def test_reference_gather_records_bounded_scratch_cost() -> None:
     pages = _pages()
     key, value = _kv(batch_size=1, query_len=8, seed=5)
     write_hunyuan_kv(pages, batch, key, value)
+    metrics = DiffusionPageMetrics()
 
-    gathered_key, gathered_value = gather_hunyuan_kv_reference(pages, batch)
+    gathered_key, gathered_value = gather_hunyuan_kv_reference(
+        pages,
+        batch,
+        metrics=metrics,
+    )
 
     expected_bytes = (gathered_key.numel() + gathered_value.numel()) * gathered_key.element_size()
     assert batch.gather_count == 1
     assert batch.gathered_bytes == expected_bytes
     assert batch.gather_latency_s >= 0
+    assert metrics.reference_gather_bytes == expected_bytes
+    assert metrics.reference_gather_latency_s == batch.gather_latency_s

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionPageMetrics
 from vllm_omni.diffusion.diffusion_kv.page import (
     DiffusionPageBinding,
     DiffusionSequenceBinding,
@@ -240,6 +241,8 @@ def write_hunyuan_kv(
 def gather_hunyuan_kv_reference(
     layer_cache: torch.Tensor,
     batch: HunyuanPagedKVBatch,
+    *,
+    metrics: DiffusionPageMetrics | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if layer_cache.ndim >= 3 and layer_cache.shape[2] != batch.block_size:
         raise ValueError(
@@ -251,7 +254,14 @@ def gather_hunyuan_kv_reference(
     gathered_values = [flat_value_pages.index_select(0, sequence.slot_mapping) for sequence in batch.sequences]
     key = torch.stack(gathered_keys, dim=0)
     value = torch.stack(gathered_values, dim=0)
+    gathered_bytes = key.numel() * key.element_size() + value.numel() * value.element_size()
+    gather_latency_s = time.perf_counter() - started
     batch.gather_count += 1
-    batch.gathered_bytes += key.numel() * key.element_size() + value.numel() * value.element_size()
-    batch.gather_latency_s += time.perf_counter() - started
+    batch.gathered_bytes += gathered_bytes
+    batch.gather_latency_s += gather_latency_s
+    if metrics is not None:
+        metrics.record_reference_gather(
+            num_bytes=gathered_bytes,
+            latency_s=gather_latency_s,
+        )
     return key, value

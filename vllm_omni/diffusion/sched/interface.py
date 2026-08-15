@@ -53,6 +53,7 @@ class WorkerKVUpdate:
     tp_rank: int
     status: WorkerKVStatus
     error: str | None = None
+    data_parallel_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class PageInstallRequest:
     request_id: str
     allocation_generation: int
     metadata: DiffusionKVMetadata
+    data_parallel_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class PageReleaseRequest:
 
     request_id: str
     allocation_generation: int
+    data_parallel_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,7 @@ class SchedulerRequestState:
     kv_readiness: DiffusionKVReadiness = DiffusionKVReadiness.READY
     allocation_generation: int | None = None
     worker_kv_rank_status: dict[int, WorkerKVStatus] = field(default_factory=dict)
+    data_parallel_rank: int | None = None
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -217,6 +221,7 @@ class NewRequestData:
     request_id: str
     req: OmniDiffusionRequest
     diffusion_kv_metadata: DiffusionKVMetadata | None = None
+    data_parallel_rank: int | None = None
 
     @classmethod
     def from_state(
@@ -229,6 +234,7 @@ class NewRequestData:
             request_id=state.request_id,
             req=state.req,
             diffusion_kv_metadata=diffusion_kv_metadata,
+            data_parallel_rank=getattr(state, "data_parallel_rank", None),
         )
 
 
