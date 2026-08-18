@@ -578,13 +578,15 @@ def test_runner_construction_does_not_initialize_page_registry_before_cache_sizi
         synchronize,
     )
 
-    runner.profile_run(SimpleNamespace())
+    request = SimpleNamespace(request_id="profile")
+    runner.profile_run([request])
 
     assert runner.kv_cache_config is None
     assert runner.page_registry is None
     assert runner.page_transfer_manager is None
     assert runner._diffusion_page_bindings == {}
     runner._execute_request_list.assert_called_once()
+    assert runner._execute_request_list.call_args.args[0] == [request]
     synchronize.assert_called_once()
 
 

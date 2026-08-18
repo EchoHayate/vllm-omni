@@ -808,6 +808,17 @@ class TestRequestScheduler:
         running = _make_request("running")
         _attach_diffusion_kv(running)
         self.scheduler.add_request(running)
+        running_install = self.scheduler.schedule()
+        assert _new_ids(running_install) == []
+        assert [item.request_id for item in running_install.page_install_reqs] == ["running"]
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "running",
+                running_install.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
         assert _new_ids(self.scheduler.schedule()) == ["running"]
 
         impossible = _make_request("impossible")
@@ -842,7 +853,17 @@ class TestRequestScheduler:
         assert failed_state.error is not None
         assert "required_blocks=4, available_blocks=3" in failed_state.error
         assert sched_output.finished_req_ids == {"impossible"}
-        assert _new_ids(sched_output) == ["schedulable"]
+        assert _new_ids(sched_output) == []
+        assert [item.request_id for item in sched_output.page_install_reqs] == ["schedulable"]
+        self.scheduler.update_worker_kv(
+            scheduler_interface.WorkerKVUpdate(
+                "schedulable",
+                sched_output.page_install_reqs[0].allocation_generation,
+                tp_rank=0,
+                status="ready",
+            )
+        )
+        assert _new_ids(self.scheduler.schedule()) == ["schedulable"]
 
     def test_diffusion_kv_internal_allocation_error_finishes_request(self, monkeypatch) -> None:
         _initialize_paged_scheduler(self.scheduler)
