@@ -78,6 +78,26 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
+_JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
+_LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
+_RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
+    "RPC result router closed",
+    "RPC result router is closed",
+}
+
+
+def _is_janus_sync_queue_shutdown(exc: Exception) -> bool:
+    if _JANUS_SYNC_QUEUE_SHUTDOWN is not None:
+        return isinstance(exc, _JANUS_SYNC_QUEUE_SHUTDOWN)
+    return isinstance(exc, RuntimeError) and str(exc) == _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE
+
+
+def _is_abort_transport_shutdown(exc: Exception) -> bool:
+    return _is_janus_sync_queue_shutdown(exc) or (
+        isinstance(exc, RuntimeError) and str(exc) in _RPC_RESULT_ROUTER_CLOSED_MESSAGES
+    )
+
+
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
     from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
@@ -1787,9 +1807,16 @@ class AsyncOmniEngine:
         Prefer :meth:`abort_async` when the caller needs acknowledgment that
         stage aborts, binding release, and orchestrator request cleanup finished.
         """
+        if not request_ids or getattr(self, "_shutdown_called", False):
+            return
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
+        try:
+            self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
+        except Exception as exc:
+            if getattr(self, "_shutdown_called", False) and _is_janus_sync_queue_shutdown(exc):
+                return
+            raise
 
     async def abort_async(
         self,
@@ -1802,6 +1829,8 @@ class AsyncOmniEngine:
         :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
         raises if the orchestrator reports failure or times out.
         """
+        if not request_ids or getattr(self, "_shutdown_called", False):
+            return
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         transport = self._correlated_rpc_client
@@ -1824,7 +1853,12 @@ class AsyncOmniEngine:
             return result_msg
 
         loop = asyncio.get_running_loop()
-        result_msg = await loop.run_in_executor(None, _wait)
+        try:
+            result_msg = await loop.run_in_executor(None, _wait)
+        except Exception as exc:
+            if getattr(self, "_shutdown_called", False) and _is_abort_transport_shutdown(exc):
+                return
+            raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")
 
