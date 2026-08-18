@@ -2,18 +2,21 @@
 
 ## Audit Identity
 
-- Audit date: August 15, 2026
-- Audited implementation head: `eb3d509c020402d7e87da26175af7311add27971`
+- Audit date: August 18, 2026
+- Restack verification head: `b97cd67624d82190c4e7210d587dafe551ea3e0a`
+- Restack base: `4cd667875f983819414ca6a19cf612b58e6c138e`
 - Pull request: `vllm-project/vllm-omni#6219`
-- Control-plane dependency: `vllm-project/vllm-omni#6094`
+- Former control-plane dependency: `vllm-project/vllm-omni#6094`, merged as
+  `0a1846aa458283a13c1a7b5a96ab585937f9726c`
 - Model: `tencent/HunyuanImage-3.0-Instruct`
 - Model revision: `2ec2c78bee7d4b94157341fba86c4c2c7b1858b2`
 - Overall status: **NO_GO**
 
 `NO_GO` means the branch is not yet accepted as complete W2a evidence. It does
 not mean the local CPU implementation tests failed. The release blockers are
-the missing formal four-H100 run, missing controlled dense/paged benchmark
-artifacts, and the still-open control-plane dependency.
+the missing formal four-H100 run and missing controlled dense/paged benchmark
+artifacts. The former stacked dependency has merged and its two commits are no
+longer part of the PR-exclusive history.
 
 ## Requirement-to-Evidence Matrix
 
@@ -112,7 +115,7 @@ pytest -q \
 ```
 
 ```text
-290 passed
+305 passed
 ```
 
 ### Full local acceptance set on vLLM 0.27
@@ -163,7 +166,25 @@ PYTHONPATH=/private/tmp/vllm-v0.27.0 \
 ```
 
 ```text
-527 passed, 7 skipped
+543 passed, 7 skipped
+```
+
+After restacking on current main, two additional tests failed because their
+fixtures still assumed pre-batching/pre-readiness contracts:
+
+- the memory-profile test passed one request directly to the now-batched
+  `profile_run(requests)` API;
+- the capacity-under-load test expected a newly allocated request to enter
+  compute before the Worker reported its page installation as `ready`.
+
+Commit `b97cd676` updates only those fixtures. It preserves the production
+contract that allocation emits `page_install_reqs`, Worker readiness is
+reported through `WorkerKVUpdate(status="ready")`, and only a later schedule
+dispatches compute. Fresh restack verification produced:
+
+```text
+305 passed
+543 passed, 7 skipped
 ```
 
 ### Changed-file hooks
@@ -181,35 +202,33 @@ These local results do not replace the hardware gates in the matrix.
 
 ## Live External State
 
-State refreshed on August 15, 2026:
+State refreshed on August 18, 2026 before publishing the restacked head:
 
 ### PR #6219
 
-- state: open draft;
-- head: `ca6e6c294ef3c18da9562a6e9247535fcd5ef8ee` at the time of the live query;
+- state: open, ready for review;
+- remote head: `9c5be4dd31a2efc60565f12744be4b6c7989f0fe`
+  at the time of the live query;
+- local restack verification head: `b97cd67624d82190c4e7210d587dafe551ea3e0a`;
 - DCO: success;
-- Read the Docs: pending;
+- Read the Docs: success on the old remote head;
 - review: required;
-- merge state: dirty because the PR is stacked on unmerged #6094;
+- merge state: conflicting on the old remote head; the local branch has been
+  rebuilt on current main and removes the merged #6094 commits from the
+  PR-exclusive range;
 - Buildkite H100 context: absent;
 - maintainer label request for `cuda-test` and `nightly-test`: posted, no
   response yet.
 
-The later local style and batch-runner fix commits do not add hardware
-evidence.
+Publishing the restacked head will refresh lightweight CI and mergeability. It
+does not add hardware evidence.
 
 ### Dependency PR #6094
 
-- state: open;
-- head: `7e2245e22c5d5df6497a0740873f261f20a7f7ca`;
-- review: required;
-- DCO, build wheels, pre-commit, Intel, NPU, and docs: success;
-- Buildkite NVIDIA: failure;
-- Buildkite AMD: failure;
-- merge state: blocked.
-
-W2a must not be treated as independently mergeable while its Scheduler-owned
-control-plane base remains unmerged and failing required checks.
+- state: merged on August 18, 2026 at `07:00:24Z`;
+- merge commit: `0a1846aa458283a13c1a7b5a96ab585937f9726c`;
+- the W2a branch has been restacked onto main after that merge;
+- the old #6094 commits are absent from the PR-exclusive history.
 
 ## Missing Evidence and Exact Closure Actions
 
@@ -261,14 +280,10 @@ The repeated and mixed labels currently describe prompt distributions. A
 receiver-local cross-request page hit must not be claimed without a directly
 observed content-key hit signal.
 
-### 3. Control-plane dependency
+### 3. Control-plane dependency — complete
 
-Owner needed: #6094 author/maintainer.
-
-- diagnose and resolve #6094 NVIDIA Buildkite failure;
-- diagnose and resolve or disposition the AMD Buildkite failure;
-- obtain review and merge #6094;
-- rebase #6219 on the merged commit and rerun local plus H100 gates.
+#6094 merged and #6219 was rebuilt on current main. The fresh local restack
+sets are green. This item is no longer an acceptance blocker.
 
 ### 4. Exact Scheduler timing, if required for a performance claim
 
@@ -294,8 +309,7 @@ still blocked because:
 
 1. PR #6219 has no formal four-H100 Buildkite result;
 2. the controlled 18-cell end-to-end A/B artifacts do not exist;
-3. dependency PR #6094 is still open and has failing Buildkite contexts;
-4. no cross-request receiver-local hit signal exists for a repeated-context
+3. no cross-request receiver-local hit signal exists for a repeated-context
    performance claim.
 
 Set this audit to `GO` only after every matrix row has direct external evidence
