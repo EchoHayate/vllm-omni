@@ -25,8 +25,7 @@ longer part of the PR-exclusive history.
 | Real Worker `kv_caches` use Scheduler block IDs | `vllm_omni/diffusion/diffusion_kv/worker_registry.py` validates `DiffusionKVMetadata` block IDs, builds native BlockTables, maps owned blocks to rank-local cache-group storage, and installs that storage on attention layers | `test_build_slot_mapping_uses_scheduler_block_ids`, `test_diffusion_kv_metadata_uses_native_cache_group_block_ids`, Worker registry tests | Required H100 full-model log is absent | **NO_GO: external gate missing** |
 | No `image_kv_cache_map` or dense AR snapshot in paged mode | `hunyuan_image3_transformer.py::_forward_paged` requires live bindings and installed pages; `pipeline_hunyuan_image3.py` snapshots/restores `_STEP_AR_KV` and `_STEP_PROMPT_KV` only outside paged mode | `test_paged_first_step_does_not_allocate_image_kv_cache_map`, `test_paged_prepare_encode_stores_no_dense_ar_kv_snapshot`, `test_paged_first_step_uses_live_binding_without_prompt_kv_snapshot` | Required dense/paged H100 parity log is absent | **NO_GO: external gate missing** |
 | Stable pages persist and dynamic slots overwrite | `paged_kv.py` builds stable/dynamic masks and writes Scheduler-selected slots; Worker binding persists across cached steps | `test_second_step_reuses_stable_slots_and_overwrites_dynamic_slots`, `test_paged_matches_dense_for_first_and_two_later_steps`, `test_cached_step_reuses_the_original_page_binding` | Required full-model multi-step parity log is absent | **NO_GO: external gate missing** |
-| Uncommitted external pages are invisible | `page.py` exposes only committed external pages as reusable; `transfer.py` commits after terminal copy completion and rejects stale generations | `test_only_committed_external_pages_are_reusable`, `test_imported_page_must_be_committed_before_batch_is_compute_ready`, `test_direct_copy_commits_only_after_event_completion`, stale/cancel/timeout tests | CUDA local-import/cancel test is defined but has no H100 execution log | **NO_GO: external gate missing** |
-| Local direct/SHM transfer uses terminal completion | `transfer.py` waits for the copy event before commit/cancel/close; `page_shm.py` copies into preallocated destinations and returns terminal transfer results | `test_pack_two_page_spans_and_copy_into_preallocated_pages`, duplicate/cancellation/sender-failure SHM tests, `test_close_waits_for_in_flight_copy_before_cancelling` | CUDA partial-prefix/cancel test is defined but has no H100 execution log | **NO_GO: external gate missing** |
+| Worker installation gates page visibility | `page.py` and the Worker registry expose Scheduler-owned blocks only after the local binding is ready | `test_imported_page_must_be_committed_before_batch_is_compute_ready`, Worker page-control readiness tests | Required H100 full-model log is absent | **NO_GO: external gate missing** |
 | Dense mode remains unchanged and does not initialize W2a | Dense branches retain `image_kv_cache_map`; runner capability and data-plane initialization are gated on `paged_scheduler` | `test_dense_first_step_still_populates_image_kv_cache_map`, `test_dense_mode_rejects_page_data_plane_initialization`, `test_dense_mode_skips_worker_kv_initialization`, `test_dense_mode_ignores_page_native_capability` | Required dense H100 accuracy case is absent | **NO_GO: external gate missing** |
 | Required topology parity passes | Scheduler owns DP rank until release ACK; executor dispatches only the selected non-EP DP replica; idle workers skip model execution | Scheduler DP ownership tests, paged DP worker idle tests, multiprocess dispatch tests; formal test includes TP1, TP2, and DP2×TP2 active/idle | No four-H100 Buildkite context exists on PR #6219 | **NO_GO: formal topology gate missing** |
 | End-to-end results and limits are reported | `benchmarks/diffusion/hunyuan_image3_page_native.py` emits request records, wave deltas, percentiles, median/MAD, sampled GPU idle, and HBM high water; report documents reference gather and attribution limits | `tests/benchmarks/test_hunyuan_image3_page_native.py` validates CLI rejection, statistics, and JSON schema | No 18-cell dense/paged raw JSON matrix is attached | **NO_GO: benchmark artifacts missing** |
@@ -118,6 +117,10 @@ pytest -q \
 305 passed
 ```
 
+This is the pre-review W2a snapshot. The review response removes the W2b-only
+transfer/session tests, so the exact current count must be refreshed in an
+environment with the pinned vLLM dependency.
+
 ### Full local acceptance set on vLLM 0.27
 
 The existing virtual environment initially resolved the editable vLLM source
@@ -160,7 +163,6 @@ PYTHONPATH=/private/tmp/vllm-v0.27.0 \
     tests/diffusion/models/hunyuan_image3 \
     tests/diffusion/test_diffusion_scheduler.py \
     tests/diffusion/test_diffusion_model_runner.py \
-    tests/distributed/omni_connectors/test_page_shm.py \
     tests/distributed/omni_connectors/test_shm_connector.py \
     tests/benchmarks/test_hunyuan_image3_page_native.py
 ```
@@ -168,6 +170,9 @@ PYTHONPATH=/private/tmp/vllm-v0.27.0 \
 ```text
 543 passed, 7 skipped
 ```
+
+This is likewise a pre-review snapshot, retained as historical evidence rather
+than claimed as the current post-scope-reduction result.
 
 After restacking on current main, two additional tests failed because their
 fixtures still assumed pre-batching/pre-readiness contracts:
@@ -180,7 +185,7 @@ fixtures still assumed pre-batching/pre-readiness contracts:
 Commit `b97cd676` updates only those fixtures. It preserves the production
 contract that allocation emits `page_install_reqs`, Worker readiness is
 reported through `WorkerKVUpdate(status="ready")`, and only a later schedule
-dispatches compute. Fresh restack verification produced:
+dispatches compute. The pre-review restack verification produced:
 
 ```text
 305 passed
@@ -249,10 +254,10 @@ Required saved evidence:
 - Buildkite URL;
 - exact tested commit;
 - `h100_4` worker identity;
-- raw log for all six formal tests;
+- raw log for all five formal test cases;
 - dense/paged accuracy metrics;
 - active/idle DP rank snapshots;
-- partial-prefix import and cancellation result.
+- DP2×TP2 active/idle ownership result.
 
 ### 2. Controlled end-to-end dense/paged matrix
 

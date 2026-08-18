@@ -70,6 +70,7 @@ The design contracts separate selection mechanics from backend algorithms:
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
+- [HunyuanImage3 Page-Native KV](feature/hunyuan_image3_page_native_kv.md)
 
 ## Infrastructure and Performance
 

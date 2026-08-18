@@ -1,6 +1,6 @@
 # HunyuanImage3 Page-Native KV Transfer Design
 
-**Status:** Approved design; W2a implementation plan prepared
+**Status:** W2a implemented; W2b remote transfer deferred
 
 **Date:** 2026-08-15
 
@@ -22,15 +22,18 @@ The work is split into two independently reviewable phases:
 
 - **W2a: local page-native data plane.** Install real rank-local `kv_caches`,
   bind Scheduler block IDs to Worker BlockTables and slot mappings, execute
-  Hunyuan attention against those pages, and integrate a completion-aware
-  SharedMemory/direct-copy path.
+  Hunyuan attention against those pages, and keep page allocation/readiness
+  under Scheduler ownership.
 - **W2b: remote missing-only transfer.** Add receiver-driven, sender-push
-  Mooncake transfer into preallocated destination pages, source leases,
-  destination completion, and missing-only page selection.
+  Mooncake/SharedMemory transfer into preallocated destination pages, source
+  leases, destination completion, transfer sessions, and missing-only page
+  selection.
 
-W2a is the first implementation target. W2b must reuse W2a's page descriptors,
-session state machine, and readiness contract rather than introducing a second
-cache representation.
+W2a is implemented first. The connector adapter, transfer-session state
+machine, and sender-push orchestration are deliberately deferred to W2b so
+they land with their first production caller. W2b must reuse W2a's page
+descriptors and readiness contract rather than introducing a second cache
+representation.
 
 The design deliberately does not extend PR #5640's dense event-driven H2D
 path. That path demonstrated a valid local-copy microbenchmark improvement but
@@ -111,13 +114,11 @@ document.
    `image_kv_cache_map`.
 4. Keep stable prefix pages allocated across denoising steps while overwriting
    dynamic target slots every step.
-5. Support local imported AR pages through an explicit transfer session and
-   completion event.
-6. Prevent pages from becoming visible to attention before installation or
-   transfer completes.
-7. Preserve `dense_legacy` behavior and fail fast when `paged_scheduler` lacks
+5. Prevent pages from becoming visible to attention before Worker installation
+   completes.
+6. Preserve `dense_legacy` behavior and fail fast when `paged_scheduler` lacks
    a required page-native capability.
-8. Produce controlled end-to-end evidence, not only helper microbenchmarks.
+7. Produce controlled end-to-end evidence, not only helper microbenchmarks.
 
 ### 3.2 W2b goals
 

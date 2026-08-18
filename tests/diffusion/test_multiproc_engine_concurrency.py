@@ -336,6 +336,33 @@ class TestRequestModeDispatch:
             exec_all_ranks=True,
         )
 
+    def test_paged_dp_matches_results_to_requests_by_assigned_replica(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=True,
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                enable_expert_parallel=False,
+            ),
+        )
+        executor.collective_rpc = Mock(
+            return_value=[
+                _tagged_output("result-for-C"),
+                _tagged_output("result-for-B"),
+            ]
+        )
+        scheduler_output = _make_sched_output("B", "C")
+        scheduler_output.scheduled_new_reqs[0].data_parallel_rank = 1
+        scheduler_output.scheduled_new_reqs[1].data_parallel_rank = 0
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [(output.request_id, output.result.error) for output in result.runner_outputs] == [
+            ("B", "result-for-B"),
+            ("C", "result-for-C"),
+        ]
+
     @pytest.mark.parametrize(
         ("tp_size", "sp_size", "pp_size", "cfg_size", "expected_primary_ranks"),
         [

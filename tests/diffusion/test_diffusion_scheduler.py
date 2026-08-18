@@ -500,7 +500,7 @@ class TestRequestScheduler:
         compute = self.scheduler.schedule()
 
         assert compute.scheduled_new_reqs[0].req.prepared_layout is prepared_layout
-        assert compute.scheduled_new_reqs[0].diffusion_kv_metadata is None
+        assert compute.scheduled_new_reqs[0].diffusion_kv_metadata == metadata
 
     def test_page_install_work_is_non_empty_without_compute(self) -> None:
         _initialize_paged_scheduler(self.scheduler)

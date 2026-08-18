@@ -36,7 +36,6 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.page import DiffusionPageBinding
-from vllm_omni.diffusion.diffusion_kv.transfer import PageTransferSessionManager
 from vllm_omni.diffusion.diffusion_kv.worker_registry import WorkerPageRegistry
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -154,7 +153,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # data-plane initialization path.
         self.kv_cache_config: KVCacheConfig | None = None
         self.page_registry: WorkerPageRegistry | None = None
-        self.page_transfer_manager: PageTransferSessionManager | None = None
         self._diffusion_page_bindings: dict[str, DiffusionPageBinding] = {}
 
         # Cache for per-request stepwise state.
@@ -445,12 +443,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             reason = "W2a page-native KV requires a CUDA platform"
         elif backend_name != "TORCH_SDPA":
             reason = f"W2a requires the TORCH_SDPA reference backend, got {backend_name}"
-        elif connector_name not in {
-            "direct",
-            "SharedMemoryConnector",
-            "SharedMemoryPageAdapter",
-        }:
-            reason = f"connector {connector_name!r} is not a W2a direct/SharedMemory page adapter"
+        elif connector_name not in {"direct", "SharedMemoryConnector"}:
+            reason = f"connector {connector_name!r} is not supported by the W2a local page data plane"
         elif (
             getattr(parallel_config, "sequence_parallel_size", 1) > 1
             or getattr(parallel_config, "ulysses_degree", 1) > 1
@@ -522,7 +516,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_cache_config: KVCacheConfig,
         layer_specs: dict[str, KVCacheSpec],
     ) -> None:
-        if self.page_registry is not None or self.page_transfer_manager is not None:
+        if self.page_registry is not None:
             raise RuntimeError("Diffusion KV page data plane is already initialized")
         scheduler_config = self.vllm_config.scheduler_config
         self.page_registry = WorkerPageRegistry(
@@ -531,10 +525,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
             max_num_reqs=scheduler_config.max_num_seqs,
             max_model_len=scheduler_config.max_model_len,
-        )
-        self.page_transfer_manager = PageTransferSessionManager(
-            registry=self.page_registry,
-            timeout_s=getattr(self.od_config, "diffusion_page_transfer_timeout_s", 30.0),
         )
         self._install_paged_kv_caches()
 
@@ -578,7 +568,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             request_id=request_id,
             metadata=metadata,
         )
-        if self.page_registry is None or self.page_transfer_manager is None:
+        if self.page_registry is None:
             raise RuntimeError("Diffusion KV page data plane is not initialized")
 
         existing = self._diffusion_page_bindings.get(request_id)
@@ -610,14 +600,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"request={request_id!r}, expected={metadata.allocation_generation}, "
                 f"got={binding.allocation_generation}"
             )
-        try:
-            self.page_transfer_manager.register_binding(binding)
-        except Exception:
-            self.page_registry.release_request(
-                binding.request_id,
-                binding.allocation_generation,
-            )
-            raise
         self._diffusion_page_bindings[request_id] = binding
         return binding
 
@@ -625,9 +607,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not request_ids:
             return
         page_registry = getattr(self, "page_registry", None)
-        page_transfer_manager = getattr(self, "page_transfer_manager", None)
         bindings = getattr(self, "_diffusion_page_bindings", {})
-        if page_registry is None or page_transfer_manager is None:
+        if page_registry is None:
             if bindings:
                 raise RuntimeError("Diffusion KV bindings exist without an initialized data plane")
             return
@@ -637,7 +618,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 continue
             metrics = getattr(page_registry, "metrics", None)
             if metrics is not None:
-                metrics.terminal_snapshots.append(
+                metrics.record_terminal_snapshot(
                     {
                         "request_id": request_id,
                         "allocation_generation": binding.allocation_generation,
@@ -646,10 +627,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "terminal_status": "released",
                     }
                 )
-            page_transfer_manager.unregister_binding(
-                request_id,
-                binding.allocation_generation,
-            )
             page_registry.release_request(
                 request_id,
                 binding.allocation_generation,
@@ -657,9 +634,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def get_diffusion_page_debug_snapshot(self) -> dict[str, object]:
         page_registry = getattr(self, "page_registry", None)
-        page_transfer_manager = getattr(self, "page_transfer_manager", None)
         bindings = getattr(self, "_diffusion_page_bindings", {})
-        enabled = page_registry is not None and page_transfer_manager is not None
+        enabled = page_registry is not None
         metrics = asdict(page_registry.metrics) if enabled else None
         active_bindings = [
             {
@@ -790,11 +766,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         return updates
 
     def shutdown_kv_cache_data_plane(self) -> None:
-        if self.page_transfer_manager is not None:
-            self.page_transfer_manager.close()
         self.release_diffusion_kv_requests(set(self._diffusion_page_bindings))
         self._clear_paged_kv_caches()
-        self.page_transfer_manager = None
         self.page_registry = None
 
     @contextmanager

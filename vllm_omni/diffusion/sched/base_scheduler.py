@@ -311,7 +311,12 @@ class BaseScheduler(ABC):
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
             if was_new_request:
-                scheduled_new_reqs.append(NewRequestData.from_state(state))
+                scheduled_new_reqs.append(
+                    NewRequestData.from_state(
+                        state,
+                        diffusion_kv_metadata=self._diffusion_kv_manager.get_metadata(request_id),
+                    )
+                )
             else:
                 scheduled_cached_request_ids.append(request_id)
 

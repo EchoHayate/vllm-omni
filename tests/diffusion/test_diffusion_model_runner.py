@@ -221,7 +221,7 @@ def test_dense_mode_ignores_page_native_capability(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.parametrize("connector_type", [None, "SharedMemoryConnector", "SharedMemoryPageAdapter"])
+@pytest.mark.parametrize("connector_type", [None, "SharedMemoryConnector"])
 def test_page_native_capability_accepts_direct_and_shared_memory(monkeypatch, connector_type):
     runner = _make_page_native_capability_runner(connector_type=connector_type)
     monkeypatch.setattr(

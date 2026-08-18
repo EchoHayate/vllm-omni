@@ -496,7 +496,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         "Paged DP returned an unexpected number of active "
                         f"results: expected {len(new_reqs)}, got {len(active_results)}"
                     )
-                for new_req, result in zip(new_reqs, active_results, strict=True):
+                assigned_ranks = [new_req.data_parallel_rank for new_req in new_reqs]
+                if any(rank is None for rank in assigned_ranks):
+                    raise RuntimeError("Paged DP request is missing its assigned data-parallel rank")
+                if len(set(assigned_ranks)) != len(assigned_ranks):
+                    raise RuntimeError(f"Paged DP requests have duplicate rank assignments: {assigned_ranks}")
+                for new_req in new_reqs:
+                    dp_rank = new_req.data_parallel_rank
+                    assert dp_rank is not None
+                    if not 0 <= dp_rank < len(results):
+                        raise RuntimeError(
+                            f"Paged DP request {new_req.request_id} targets rank {dp_rank}, "
+                            f"but only {len(results)} rank results were returned"
+                        )
+                    result = results[dp_rank]
+                    if result is None:
+                        raise RuntimeError(
+                            f"Paged DP rank {dp_rank} returned no result for request {new_req.request_id}"
+                        )
                     if not isinstance(result, DiffusionOutput):
                         raise RuntimeError(f"Unexpected paged DP response type: {type(result)!r}")
                     runner_outputs.append(
