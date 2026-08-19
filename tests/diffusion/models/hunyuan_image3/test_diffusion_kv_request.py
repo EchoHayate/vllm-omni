@@ -407,16 +407,21 @@ def test_rejects_tokenizer_cfg_row_mismatch() -> None:
 def test_sender_endpoint_does_not_change_local_kv_request() -> None:
     tokenizer, image_processor = _components([12])
     request = _request(guidance_scale=1.0)
-    request.kv_sender_info = {"host": "127.0.0.1", "zmq_port": 5000}
+    request.kv_sender_info = {
+        "host": "127.0.0.1",
+        "zmq_port": 5000,
+        "page_native": {"available_prefix_token_count": 0},
+    }
     prepared_layout = _prepare(request, tokenizer, image_processor)
 
     kv_requests = build_hunyuan_diffusion_kv_requests(request, prepared_layout)
 
     assert kv_requests[0].seq_len == 32
     assert kv_requests[0].num_computed_tokens == 0
+    assert kv_requests[0].imported_prefix_token_count == 0
 
 
-def test_page_native_sender_info_sets_imported_prefix_boundary() -> None:
+def test_page_native_sender_info_rejects_imported_prefix_without_installer() -> None:
     tokenizer, image_processor = _components([12])
     request = _request(guidance_scale=1.0)
     request.kv_sender_info = {
@@ -428,10 +433,11 @@ def test_page_native_sender_info_sets_imported_prefix_boundary() -> None:
     }
     prepared_layout = _prepare(request, tokenizer, image_processor)
 
-    kv_requests = build_hunyuan_diffusion_kv_requests(request, prepared_layout)
-
-    assert kv_requests[0].imported_prefix_token_count == 8
-    assert not hasattr(kv_requests[0], "dense_ar_kv")
+    with pytest.raises(
+        ValueError,
+        match="imported page-native KV requires an installer",
+    ):
+        build_hunyuan_diffusion_kv_requests(request, prepared_layout)
 
 
 def test_rejects_stable_and_dynamic_geometry_beyond_valid_sequence() -> None:

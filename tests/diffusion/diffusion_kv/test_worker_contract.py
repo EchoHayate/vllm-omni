@@ -26,7 +26,11 @@ from vllm_omni.diffusion.sched.interface import (
     WorkerKVUpdate,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerWrapperBase
+from vllm_omni.diffusion.worker.diffusion_worker import (
+    DiffusionWorker,
+    WorkerProc,
+    WorkerWrapperBase,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -239,6 +243,199 @@ def test_executor_runs_page_control_on_all_ranks_without_model_request() -> None
             True,
         )
     ]
+
+
+@pytest.mark.parametrize("status", ["ready", "released"])
+def test_page_control_rpc_primary_returns_updates_from_all_tp_ranks(
+    monkeypatch,
+    status,
+) -> None:
+    update_rank0 = WorkerKVUpdate(
+        "req",
+        1,
+        tp_rank=0,
+        status=status,
+        data_parallel_rank=1,
+    )
+    update_rank1 = WorkerKVUpdate(
+        "req",
+        1,
+        tp_rank=1,
+        status=status,
+        data_parallel_rank=1,
+    )
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = SimpleNamespace(
+        _process_diffusion_page_control=Mock(return_value=[update_rank0]),
+    )
+    worker_wrapper = SimpleNamespace(
+        execute_method=lambda method, *args, **kwargs: getattr(worker, method)(
+            *args,
+            **kwargs,
+        )
+    )
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.gpu_id = 0
+    worker_proc.result_mq = object()
+    worker_proc.worker = worker_wrapper
+    tp_cpu_group = object()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=tp_cpu_group),
+    )
+
+    def all_gather_object(outputs, local_value, *, group):
+        assert group is tp_cpu_group
+        outputs[:] = [
+            local_value,
+            (True, [update_rank1]),
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_pipeline_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    scheduler_output = (
+        make_scheduler_output(
+            page_installs=(
+                PageInstallRequest(
+                    request_id="req",
+                    allocation_generation=1,
+                    metadata=make_metadata("req"),
+                    data_parallel_rank=1,
+                ),
+            )
+        )
+        if status == "ready"
+        else make_scheduler_output(
+            page_releases=(
+                PageReleaseRequest(
+                    request_id="req",
+                    allocation_generation=1,
+                    data_parallel_rank=1,
+                ),
+            )
+        )
+    )
+    rpc_request = {
+        "method": "update_diffusion_kv_pages",
+        "args": (scheduler_output,),
+        "kwargs": {},
+        "output_rank": None,
+        "exec_all_ranks": True,
+        "collect_rank_status": False,
+        "wave_id": 7,
+    }
+
+    updates, should_reply = worker_proc._execute_rpc(rpc_request)
+
+    assert should_reply is True
+    assert updates == [update_rank0, update_rank1]
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+        lambda: 1,
+    )
+
+    _, should_reply = worker_proc._execute_rpc(rpc_request)
+
+    assert should_reply is False
+
+
+def test_page_control_rpc_gathers_tp_failure_before_raising(
+    monkeypatch,
+) -> None:
+    update_rank1 = WorkerKVUpdate("req", 1, tp_rank=1, status="ready")
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = SimpleNamespace(
+        _process_diffusion_page_control=Mock(
+            side_effect=ValueError("rank-local failure"),
+        ),
+    )
+    worker_proc = object.__new__(WorkerProc)
+    worker_proc.gpu_id = 0
+    worker_proc.result_mq = object()
+    worker_proc.worker = SimpleNamespace(
+        execute_method=lambda method, *args, **kwargs: getattr(worker, method)(
+            *args,
+            **kwargs,
+        )
+    )
+    tp_cpu_group = object()
+    gathered = Mock()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, cpu_group=tp_cpu_group),
+    )
+
+    def all_gather_object(outputs, local_value, *, group):
+        gathered(local_value, group)
+        outputs[:] = [
+            local_value,
+            (True, [update_rank1]),
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_pipeline_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+
+    with pytest.raises(RuntimeError, match="TP rank 0.*rank-local failure"):
+        worker_proc._execute_rpc(
+            {
+                "method": "update_diffusion_kv_pages",
+                "args": (
+                    make_scheduler_output(
+                        page_installs=(
+                            PageInstallRequest(
+                                request_id="req",
+                                allocation_generation=1,
+                                metadata=make_metadata("req"),
+                            ),
+                        )
+                    ),
+                ),
+                "kwargs": {},
+                "output_rank": None,
+                "exec_all_ranks": True,
+                "collect_rank_status": False,
+                "wave_id": 8,
+            }
+        )
+
+    gathered.assert_called_once()
+    local_value, group = gathered.call_args.args
+    assert local_value[0] is False
+    assert "rank-local failure" in local_value[1]
+    assert group is tp_cpu_group
 
 
 def test_batch_path_rejects_missing_metadata_before_forward() -> None:

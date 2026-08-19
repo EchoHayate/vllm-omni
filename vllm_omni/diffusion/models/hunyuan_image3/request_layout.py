@@ -350,6 +350,11 @@ def build_hunyuan_diffusion_kv_requests(
     target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
     page_native_info = (request.kv_sender_info or {}).get("page_native") or {}
     imported_prefix_token_count = int(page_native_info.get("available_prefix_token_count", 0))
+    if imported_prefix_token_count > 0:
+        raise ValueError(
+            "HunyuanImage3 imported page-native KV requires an installer, "
+            "which is not implemented in the current W2a runtime"
+        )
     requests: list[DiffusionKVRequest] = []
     for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos)):
         prefix_len = int(prefix_row[-1].item())

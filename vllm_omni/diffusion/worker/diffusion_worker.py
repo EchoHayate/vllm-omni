@@ -92,6 +92,18 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     return values
 
 
+def _all_gather_tp_rank_values(value: Any) -> list[Any]:
+    if not dist.is_available() or not dist.is_initialized():
+        return [value]
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    values: list[Any] = [None] * tp_group.world_size
+    dist.all_gather_object(values, value, group=tp_group.cpu_group)
+    return values
+
+
 def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list[Any]:
     """Run one rank-local probe without stranding peers on local failure."""
 
@@ -634,7 +646,20 @@ class DiffusionWorker:
         """Apply page install/release control work without model execution."""
 
         assert self.model_runner is not None, "Model runner not initialized"
-        return self.model_runner._process_diffusion_page_control(scheduler_output)
+        try:
+            local_result = (
+                True,
+                self.model_runner._process_diffusion_page_control(scheduler_output),
+            )
+        except Exception as exc:
+            logger.exception("Diffusion page control failed on this TP rank")
+            local_result = (False, f"{type(exc).__name__}: {exc}")
+
+        rank_results = _all_gather_tp_rank_values(local_result)
+        failures = [f"TP rank {rank}: {result}" for rank, (ok, result) in enumerate(rank_results) if not ok]
+        if failures:
+            raise RuntimeError("Diffusion page control failed on " + "; ".join(failures))
+        return [update for _, rank_updates in rank_results for update in rank_updates]
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
