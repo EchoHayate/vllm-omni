@@ -528,11 +528,7 @@ def test_llama_omni2_thinker_terminal_send_reclaims_canonical_state(build_adapte
 
     adapter._send_single_request(
         {
-            "multimodal_output": {
-                "hidden_states": {
-                    "output": torch.tensor([[0.0, 11.0], [0.0, 12.0]])
-                }
-            },
+            "multimodal_output": {"hidden_states": {"output": torch.tensor([[0.0, 11.0], [0.0, 12.0]])}},
             "request": request,
             "is_finished": True,
             "is_segment_finished": False,
@@ -571,9 +567,7 @@ def test_llama_omni2_talker_terminal_send_reclaims_canonical_state(
 
     adapter._send_single_request(
         {
-            "multimodal_output": {
-                "codes": {"audio": torch.tensor([151766, 151767])}
-            },
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151767])}},
             "request": request,
             "is_finished": True,
             "is_segment_finished": False,
@@ -606,9 +600,7 @@ def test_llama_omni2_terminal_processor_error_reclaims_state_after_marker_send(
 
     adapter._send_single_request(
         {
-            "multimodal_output": {
-                "codes": {"audio": torch.tensor([151766, 151665])}
-            },
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151665])}},
             "request": request,
             "is_finished": True,
             "is_segment_finished": False,
@@ -641,9 +633,7 @@ def test_llama_omni2_failed_terminal_send_preserves_state(build_adapter):
 
     adapter._send_single_request(
         {
-            "multimodal_output": {
-                "codes": {"audio": torch.tensor([151766, 151767])}
-            },
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151767])}},
             "request": request,
             "is_finished": True,
             "is_segment_finished": False,

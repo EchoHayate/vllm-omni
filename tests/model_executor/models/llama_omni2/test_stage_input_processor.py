@@ -17,6 +17,8 @@ from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
     thinker2talker_token_only,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_full_payload_cumulative_snapshots_replace_instead_of_append():
     assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset(
