@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import math
@@ -146,6 +149,7 @@ class OmniSchedulerMixin:
 
     def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
+        session.max_tokens = update.max_tokens
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
