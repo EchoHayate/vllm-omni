@@ -52,6 +52,7 @@ def test_llama_omni2_pipeline_has_native_three_stage_topology():
     assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert talker.async_chunk_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert talker.sampling_constraints["detokenize"] is False
+    assert talker.sampling_constraints["stop_token_ids"] == [151643]
 
     assert code2wav.model_stage == "code2wav"
     assert code2wav.input_sources == (1,)
@@ -112,6 +113,7 @@ def test_llama_omni2_default_deploy_uses_independent_decoder_checkpoint():
     assert deploy.stages[2].model == "ICTNLP/cosy2_decoder"
     assert stages[0].yaml_engine_args["async_scheduling"] is True
     assert stages[1].yaml_engine_args["async_scheduling"] is False
+    assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [151643]
     assert stages[2].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args["dtype"] == "float32"
     assert stages[2].yaml_engine_args["enforce_eager"] is True

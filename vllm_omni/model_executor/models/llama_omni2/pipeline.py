@@ -47,7 +47,10 @@ LLAMA_OMNI2_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
-            sampling_constraints={"detokenize": False},
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [151643],
+            },
         ),
         StagePipelineConfig(
             stage_id=2,

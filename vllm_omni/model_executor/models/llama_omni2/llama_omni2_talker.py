@@ -34,6 +34,10 @@ TALKER_WEIGHTS_MAPPER = Qwen2Model.hf_to_vllm_mapper | WeightsMapper(
     }
 )
 
+TALKER_EOS_TOKEN_ID = 151643
+TALKER_CODEC_TOKEN_OFFSET = 151666
+TALKER_CODEC_VOCAB_SIZE = 6561
+
 
 class LlamaOmni2TalkerForConditionalGeneration(nn.Module, SupportsPP):
     """Projected/gated Thinker features consumed by native vLLM Qwen2."""
@@ -282,6 +286,16 @@ class LlamaOmni2TalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
 
     def sample(self, logits: torch.Tensor, sampling_metadata: object):
+        codec_end = TALKER_CODEC_TOKEN_OFFSET + TALKER_CODEC_VOCAB_SIZE
+        if logits.shape[-1] < codec_end:
+            raise ValueError(
+                "LLaMA-Omni 2 Talker logits must cover the EOS and codec "
+                f"token range through {codec_end - 1}, got {logits.shape[-1]}"
+            )
+        logits[..., :TALKER_EOS_TOKEN_ID] = float("-inf")
+        logits[..., TALKER_EOS_TOKEN_ID + 1 : TALKER_CODEC_TOKEN_OFFSET] = float("-inf")
+        logits[..., codec_end:] = float("-inf")
+
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
             from vllm.v1.sample.sampler import Sampler

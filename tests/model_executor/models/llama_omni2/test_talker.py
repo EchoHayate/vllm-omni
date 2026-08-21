@@ -176,6 +176,36 @@ def test_talker_composes_registered_vllm_qwen2_and_delegates_logits(
     assert embeddings.shape == (2, 8)
 
 
+def test_talker_sampler_masks_non_codec_tokens():
+    model = object.__new__(LlamaOmni2TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    captured = {}
+
+    class CapturingSampler:
+        def __call__(self, *, logits, sampling_metadata):
+            captured["logits"] = logits.detach().clone()
+            captured["sampling_metadata"] = sampling_metadata
+            return SimpleNamespace(
+                sampled_token_ids=torch.tensor([[151666]], dtype=torch.int32),
+            )
+
+    model._sampler = CapturingSampler()
+    logits = torch.zeros((1, 158228), dtype=torch.float32)
+    sampling_metadata = object()
+
+    model.sample(logits, sampling_metadata)
+
+    masked = captured["logits"][0]
+    assert captured["sampling_metadata"] is sampling_metadata
+    assert torch.isneginf(masked[6240])
+    assert torch.isfinite(masked[151643])
+    assert torch.isneginf(masked[151644])
+    assert torch.isneginf(masked[151665])
+    assert torch.isfinite(masked[151666])
+    assert torch.isfinite(masked[158226])
+    assert torch.isneginf(masked[158227])
+
+
 def test_talker_weight_mapper_routes_real_checkpoint_prefixes():
     checkpoint_names = [
         "speech_generator.input_proj.0.weight",
