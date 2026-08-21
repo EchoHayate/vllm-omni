@@ -12,15 +12,17 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
+
 A typical PEFT-format LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
 ```
 
 The `adapter_config.json` file contains metadata about the LoRA adapter, including:
+
 - `r`: LoRA rank
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
@@ -88,7 +90,7 @@ For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
 
 | Pipeline | Supported distilled LoRA repo | Notes |
-|----------|--------------------------------|-------|
+| ---------- | -------------------------------- | ------- |
 | `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
@@ -260,7 +262,6 @@ Notes:
 - This route avoids runtime LoRA loading changes in vLLM-Omni when you choose to bake converted weights into a local Diffusers directory.
 - Output quality and speed depend on the replacement checkpoints and sampling params you choose.
 - If you only need to fuse distilled LoRAs into a Wan2.2 checkpoint at load time (without the full LightX2V convert + assemble pipeline), you can instead pass them directly via `--lora-backend distill --lora-path <high>.safetensors <low>.safetensors`. See the [Distill backend](#distill-backend-fuse-distilled-lora-at-init) section above.
-
 
 ## See Also
 

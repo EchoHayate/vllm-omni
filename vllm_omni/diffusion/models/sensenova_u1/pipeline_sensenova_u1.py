@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
