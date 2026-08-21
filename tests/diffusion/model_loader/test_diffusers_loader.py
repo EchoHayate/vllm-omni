@@ -14,8 +14,13 @@ from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    HostWeightPlan,
+    HostWeightPlanResult,
+    TensorBinding,
+)
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.registry import initialize_model
 
@@ -84,6 +89,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
 
     loader.get_all_weights = _iter_weights  # type: ignore[assignment]
     return loader
+
+
+def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(
+        model="",
+        dtype=torch.float32,
+        quantization_config="fp8",
+        parallel_config=DiffusionParallelConfig(data_parallel_size=2),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
 
 
 def test_strict_check_only_validates_source_prefix_parameters():
@@ -256,6 +272,209 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     assert model.captured_config is od_config
     assert model.seen_config_during_init is od_config
     assert get_current_diffusion_config_or_none() is None
+
+
+def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        quantization_config=None,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    plan = HostWeightPlan(
+        backing_kind="checkpoint_mmap",
+        bindings={},
+    )
+    loaded_ordinary_weights = False
+
+    def load_weights(_model):
+        nonlocal loaded_ordinary_weights
+        loaded_ordinary_weights = True
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = load_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(plan),
+    )
+
+    assert loader.load_model(load_device="cpu") is model
+    assert not loaded_ordinary_weights
+    assert loader.take_host_weight_plan() is plan
+    assert loader.take_host_weight_plan() is None
+
+
+def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        quantization_config=None,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+
+    class MixedSourceModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Linear(2, 2, bias=False)
+            self.text_encoder = nn.Linear(2, 2, bias=False)
+            self.weights_sources = (
+                DiffusersPipelineLoader.ComponentSource("unused", None, None, prefix="transformer."),
+                DiffusersPipelineLoader.ComponentSource("unused", None, None, prefix="text_encoder."),
+            )
+            self.loaded_weight_names: list[str] = []
+
+        def load_weights(self, weights):
+            self.loaded_weight_names = [name for name, _ in weights]
+            return set(self.loaded_weight_names)
+
+    model = MixedSourceModel()
+    plan = HostWeightPlan(
+        backing_kind="checkpoint_mmap",
+        bindings={
+            "transformer.weight": TensorBinding(
+                checkpoint_key="weight",
+                file_path="unused",
+            )
+        },
+        planned_source_prefixes=frozenset({"transformer."}),
+    )
+    requested_prefixes: list[str] = []
+
+    def get_weights(source, model=None):
+        del model
+        requested_prefixes.append(source.prefix)
+        yield source.prefix + "weight", torch.ones(2, 2)
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader._get_weights_iterator = get_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(plan),
+    )
+
+    assert loader.load_model(load_device="cpu") is model
+    assert requested_prefixes == ["text_encoder."]
+    assert model.loaded_weight_names == ["text_encoder.weight"]
+    assert loader.take_host_weight_plan() is plan
+
+
+def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        quantization_config=None,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    calls: list[str] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: calls.append("load")  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(None, "not direct-compatible"),
+    )
+
+    assert loader.load_model(load_device="cpu") is model
+    assert calls == ["load", "process"]
+    assert loader.take_host_weight_plan() is None
+
+
+def test_dlo_allgather_online_fp8_uses_ordinary_loader(monkeypatch):
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
+
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(Fp8PerTensorOnlineLinearMethod)
+    model.transformer.quant_method.uses_meta_device = True
+    calls: list[object] = []
+    allowlist_models: list[nn.Module] = []
+
+    original_allowlist_check = loader._unsupported_dlo_allgather_online_quant_methods
+
+    def check_allowlist(candidate: nn.Module) -> tuple[str, ...]:
+        allowlist_models.append(candidate)
+        return original_allowlist_check(candidate)
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    monkeypatch.setattr(loader, "_unsupported_dlo_allgather_online_quant_methods", check_allowlist)
+    loader._request_offload_after_quant = lambda _model: 1  # type: ignore[method-assign]
+    loader.load_weights = (  # type: ignore[method-assign]
+        lambda _model, *, stream_online_quant_to_cpu=False: calls.append(("load", stream_online_quant_to_cpu))
+    )
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cpu")) is model
+    assert allowlist_models == [model]
+    assert calls == [("load", True), "process"]
+    assert loader.take_host_weight_plan() is None
+
+
+def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    class UnsupportedOnlineMethod:
+        uses_meta_device = True
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = UnsupportedOnlineMethod()
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="per-tensor FP8 linears"):
+        loader.load_model(load_device="cpu")
 
 
 def test_hsdp_processes_quantized_weights_before_sharding(mocker):

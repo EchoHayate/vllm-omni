@@ -29,7 +29,7 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_dit_group,
+    get_world_group,
     init_world_group,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -423,7 +423,7 @@ def _validate_reference_image(image: Image.Image) -> None:
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
-    group = get_dit_group()
+    group = get_world_group().device_group
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
@@ -540,13 +540,6 @@ class MiniMaxH3Pipeline(
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
         on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
     )
-    # H3's regular loader performs checkpoint-layout conversions (grouped QKV
-    # and fused MLP). Keep it on that path until mmap can run the same loader
-    # callbacks for every affected parameter.
-    _supports_mmap_loading: ClassVar[bool] = False
-    # TODO(offload): Re-enable after the generic rank-local mmap path can run
-    # this model's grouped-QKV reorder and fused-MLP packing before TP sharding.
-    # Do not bypass the regular loader until that equivalence is tested.
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
         "encode_prompt",
@@ -1722,7 +1715,7 @@ class MiniMaxH3Pipeline(
                     dist.broadcast(
                         has_audio_tensor,
                         src=0,
-                        group=get_dit_group(),
+                        group=get_world_group().device_group,
                     )
                 has_audio = [bool(value) for value in has_audio_tensor.tolist()]
 

@@ -1102,6 +1102,13 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_rejects_legacy_stage_args_schema(self, tmp_path):
+        deploy_path = tmp_path / "legacy.yaml"
+        deploy_path.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
+            load_deploy_config(deploy_path)
+
     def test_load_minicpmo_duplex_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5_duplex.yaml"))
 
@@ -1120,9 +1127,11 @@ class TestDeployConfigLoading:
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False
-        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 2048
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
         assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
-        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+        assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -1377,7 +1386,8 @@ stages:
         assert async_stages[1].custom_process_input_func is None
 
     def test_no_bundled_legacy_stage_config_yamls(self):
-        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        repo_root = Path(__file__).resolve().parents[2]
+        stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"
         assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):
@@ -2102,6 +2112,23 @@ class TestMingFlashOmniPipeline:
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
+
+    def test_minicpmo_overlays_inherit_talker_sampling_params(self):
+        """Overlays must keep the base Talker codec Sampler knobs."""
+        for filename in (
+            "minicpmo_4_5_duplex.yaml",
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_8x4090_stage1_replicas.yaml",
+        ):
+            path = Path(get_deploy_config_path(filename))
+            if not path.exists():
+                pytest.skip(f"{filename} not found")
+            deploy = load_deploy_config(path)
+            sampling = deploy.stages[1].default_sampling_params
+            assert sampling is not None, f"{filename} stage 1 lost default_sampling_params"
+            assert sampling["temperature"] == 0.8, filename
+            assert sampling["top_k"] == 100, filename
 
     def test_ci_inherits_from_main(self):
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
