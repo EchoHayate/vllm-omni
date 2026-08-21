@@ -308,8 +308,15 @@ def test_thinker_async_accepts_one_request_local_hidden_row_per_batched_step():
         is None
     )
 
-    assert manager._llama_omni2_pending_thinker_rows["request-a"]["hidden"][0].tolist() == [[1.0, 11.0]]
-    assert manager._llama_omni2_pending_thinker_rows["request-b"]["hidden"][0].tolist() == [[2.0, 21.0]]
+    request_a_state = manager.request_payload["request-a"]
+    request_b_state = manager.request_payload["request-b"]
+
+    assert request_a_state["_llama_omni2_pending_thinker_rows"]["hidden"][0].tolist() == [[1.0, 11.0]]
+    assert request_b_state["_llama_omni2_pending_thinker_rows"]["hidden"][0].tolist() == [[2.0, 21.0]]
+    assert "_llama_omni2_stream_state" in request_a_state
+    assert "_llama_omni2_stream_state" in request_b_state
+    assert not hasattr(manager, "_llama_omni2_stream_states")
+    assert not hasattr(manager, "_llama_omni2_pending_thinker_rows")
 
 
 def test_thinker_async_terminal_tail_appends_separator_once():

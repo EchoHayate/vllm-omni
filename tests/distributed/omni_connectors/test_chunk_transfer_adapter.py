@@ -512,6 +512,149 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
 
 
+def test_llama_omni2_thinker_terminal_send_reclaims_canonical_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        thinker2talker_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=0)
+    request = _req(
+        "thinker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="thinker-external",
+    )
+    request.output_token_ids = [11, 12]
+    adapter.custom_process_next_stage_input_func = thinker2talker_async_chunk
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {
+                "hidden_states": {
+                    "output": torch.tensor([[0.0, 11.0], [0.0, 12.0]])
+                }
+            },
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert "thinker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+    assert not hasattr(adapter, "_llama_omni2_pending_thinker_rows")
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [RequestStatus.FINISHED_STOPPED, RequestStatus.FINISHED_ABORTED],
+)
+def test_llama_omni2_talker_terminal_send_reclaims_canonical_state(
+    build_adapter,
+    terminal_status,
+):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        terminal_status,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {
+                "codes": {"audio": torch.tensor([151766, 151767])}
+            },
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert "talker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
+def test_llama_omni2_terminal_processor_error_reclaims_state_after_marker_send(
+    build_adapter,
+):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {
+                "codes": {"audio": torch.tensor([151766, 151665])}
+            },
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert connector.put.called
+    assert "talker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
+def test_llama_omni2_failed_terminal_send_preserves_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+    connector.put.return_value = (False, 0, {})
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {
+                "codes": {"audio": torch.tensor([151766, 151767])}
+            },
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert connector.put.called
+    assert "talker-external" in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
