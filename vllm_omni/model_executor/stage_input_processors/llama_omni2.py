@@ -29,6 +29,8 @@ TALKER_EOS_TOKEN_ID = 151643
 TALKER_SEPARATOR_TOKEN_ID = 151665
 TALKER_CODEC_TOKEN_OFFSET = 151666
 TALKER_CODEC_VOCAB_SIZE = 6561
+_STREAM_STATE_KEY = "_llama_omni2_stream_state"
+_PENDING_THINKER_ROWS_KEY = "_llama_omni2_pending_thinker_rows"
 
 
 def _new_items(name: str, previous: list[int], current: list[int]) -> list[int]:
@@ -148,17 +150,32 @@ class LlamaOmni2StreamState:
 
 
 class LlamaOmni2StreamStateStore:
-    def __init__(self) -> None:
-        self._states: dict[str, LlamaOmni2StreamState] = {}
+    def __init__(
+        self,
+        request_payload: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self._request_payload = request_payload if request_payload is not None else {}
 
     def get(self, request_id: str) -> LlamaOmni2StreamState:
-        return self._states.setdefault(request_id, LlamaOmni2StreamState())
+        container = self._request_payload.setdefault(request_id, {})
+        state = container.get(_STREAM_STATE_KEY)
+        if not isinstance(state, LlamaOmni2StreamState):
+            state = LlamaOmni2StreamState()
+            container[_STREAM_STATE_KEY] = state
+        return state
 
     def cancel(self, request_id: str) -> None:
-        self._states.pop(request_id, None)
+        container = self._request_payload.get(request_id)
+        if not isinstance(container, dict):
+            return
+        container.pop(_STREAM_STATE_KEY, None)
+        container.pop(_PENDING_THINKER_ROWS_KEY, None)
+        if not container:
+            self._request_payload.pop(request_id, None)
 
     def __contains__(self, request_id: object) -> bool:
-        return request_id in self._states
+        container = self._request_payload.get(request_id)
+        return isinstance(container, dict) and _STREAM_STATE_KEY in container
 
 
 def _request_id(request: Any, fallback: str | None = None) -> str:
@@ -173,11 +190,26 @@ def _request_id(request: Any, fallback: str | None = None) -> str:
 
 
 def _state_store(transfer_manager: Any) -> LlamaOmni2StreamStateStore:
-    store = getattr(transfer_manager, "_llama_omni2_stream_states", None)
-    if store is None:
-        store = LlamaOmni2StreamStateStore()
-        transfer_manager._llama_omni2_stream_states = store
-    return store
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    return LlamaOmni2StreamStateStore(request_payload)
+
+
+def _request_state_container(
+    transfer_manager: Any,
+    request_id: str,
+) -> dict[str, Any]:
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    container = request_payload.get(request_id)
+    if not isinstance(container, dict):
+        container = {}
+        request_payload[request_id] = container
+    return container
 
 
 def _tensor_from_payload(
@@ -240,11 +272,12 @@ def _runner_hidden_new_rows(
 
 
 def _pending_tensor_rows(transfer_manager: Any, request_id: str) -> dict[str, list[torch.Tensor]]:
-    pending = getattr(transfer_manager, "_llama_omni2_pending_thinker_rows", None)
-    if pending is None:
-        pending = {}
-        transfer_manager._llama_omni2_pending_thinker_rows = pending
-    return pending.setdefault(request_id, {"embed": [], "hidden": []})
+    container = _request_state_container(transfer_manager, request_id)
+    pending = container.get(_PENDING_THINKER_ROWS_KEY)
+    if not isinstance(pending, dict):
+        pending = {"embed": [], "hidden": []}
+        container[_PENDING_THINKER_ROWS_KEY] = pending
+    return pending
 
 
 def _pop_rows(
