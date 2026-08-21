@@ -103,6 +103,15 @@ def test_convert_sensenova_lora_rejects_inconsistent_rank(tmp_path):
         convert_sensenova_lora(source_path, tmp_path / "peft")
 
 
+def test_convert_sensenova_lora_rejects_zero_rank(tmp_path):
+    source_path = tmp_path / "official.safetensors"
+    tensors = _source_tensors(rank=0)
+    _write_source(source_path, tensors)
+
+    with pytest.raises(ValueError, match="positive rank"):
+        convert_sensenova_lora(source_path, tmp_path / "peft")
+
+
 def test_convert_sensenova_lora_rejects_missing_down(tmp_path):
     source_path = tmp_path / "official.safetensors"
     tensors = _source_tensors()

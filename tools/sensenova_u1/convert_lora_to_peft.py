@@ -70,6 +70,8 @@ def _convert_tensors(
                 f"{module_name} LoRA weights must be matrices, got {tuple(lora_a.shape)} and {tuple(lora_b.shape)}"
             )
         rank = lora_a.shape[0]
+        if rank <= 0:
+            raise ValueError(f"{module_name} LoRA weights must have a positive rank, got {rank}")
         if lora_b.shape[1] != rank:
             raise ValueError(f"{module_name} rank mismatch: lora_down rank {rank}, lora_up rank {lora_b.shape[1]}")
 
