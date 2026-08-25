@@ -7,6 +7,8 @@ import time
 
 import torch
 
+from vllm_omni.platforms import current_omni_platform
+
 
 def run_case(
     *,
@@ -52,7 +54,7 @@ def run_case(
     estimator_stream.synchronize()
     input_tensor.zero_()
     torch.accelerator.reset_peak_memory_stats(device)
-    initial_allocated = torch.cuda.memory_allocated(device)
+    initial_allocated = torch.accelerator.memory_allocated(device)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -96,7 +98,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    current_omni_platform.set_device(device)
     torch.manual_seed(0)
 
     old_results = []
