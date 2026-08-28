@@ -46,7 +46,7 @@ def test_abort_tolerates_queue_close_race_during_shutdown(mocker: MockerFixture)
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         _SyntheticSyncQueueShutDownError,
     )
 
@@ -65,7 +65,7 @@ def test_abort_tolerates_legacy_janus_close_error_during_shutdown(mocker: Mocker
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         None,
     )
 
@@ -86,7 +86,7 @@ def test_abort_surfaces_unrelated_legacy_runtime_error_during_shutdown(
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         None,
     )
 
@@ -106,7 +106,7 @@ def test_abort_surfaces_unexpected_closed_queue(mocker: MockerFixture):
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         _SyntheticSyncQueueShutDownError,
     )
     engine.request_queue.sync_q.put.side_effect = _SyntheticSyncQueueShutDownError

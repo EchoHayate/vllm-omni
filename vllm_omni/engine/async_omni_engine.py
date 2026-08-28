@@ -44,6 +44,8 @@ from vllm_omni.engine.async_engine_utils import (
     apply_omni_final_stage_metadata,
     enqueue_orchestrator_shutdown,
     inject_global_id,
+    is_abort_transport_shutdown,
+    is_janus_sync_queue_shutdown,
     shutdown_runtime_after_orchestrator,
     upgrade_to_omni_request,
     weak_shutdown_async_omni_engine,
@@ -77,26 +79,6 @@ from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
-
-_JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
-_LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
-_RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
-    "RPC result router closed",
-    "RPC result router is closed",
-}
-
-
-def _is_janus_sync_queue_shutdown(exc: Exception) -> bool:
-    if _JANUS_SYNC_QUEUE_SHUTDOWN is not None:
-        return isinstance(exc, _JANUS_SYNC_QUEUE_SHUTDOWN)
-    return isinstance(exc, RuntimeError) and str(exc) == _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE
-
-
-def _is_abort_transport_shutdown(exc: Exception) -> bool:
-    return _is_janus_sync_queue_shutdown(exc) or (
-        isinstance(exc, RuntimeError) and str(exc) in _RPC_RESULT_ROUTER_CLOSED_MESSAGES
-    )
-
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
@@ -1814,7 +1796,7 @@ class AsyncOmniEngine:
         try:
             self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
         except Exception as exc:
-            if getattr(self, "_shutdown_called", False) and _is_janus_sync_queue_shutdown(exc):
+            if getattr(self, "_shutdown_called", False) and is_janus_sync_queue_shutdown(exc):
                 return
             raise
 
@@ -1856,7 +1838,7 @@ class AsyncOmniEngine:
         try:
             result_msg = await loop.run_in_executor(None, _wait)
         except Exception as exc:
-            if getattr(self, "_shutdown_called", False) and _is_abort_transport_shutdown(exc):
+            if getattr(self, "_shutdown_called", False) and is_abort_transport_shutdown(exc):
                 return
             raise
         if not result_msg.success:

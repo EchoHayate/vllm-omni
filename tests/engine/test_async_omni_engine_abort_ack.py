@@ -198,7 +198,7 @@ def test_abort_async_tolerates_request_queue_close_during_shutdown(
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         SyntheticSyncQueueShutDownError,
     )
 
@@ -226,7 +226,7 @@ def test_abort_async_surfaces_request_queue_close_while_engine_is_live(
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine._JANUS_SYNC_QUEUE_SHUTDOWN",
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
         SyntheticSyncQueueShutDownError,
     )
 
