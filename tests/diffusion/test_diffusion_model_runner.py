@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -11,6 +11,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
@@ -192,6 +193,11 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+    )
+    runner.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
+        vllm_config=runner.vllm_config,
+        od_config=runner.od_config,
+        device=runner.device,
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
@@ -527,7 +533,14 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
         return original_execute(*args, **kwargs)
 
     runner._execute_request_list = execute
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -543,6 +556,8 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
 
     assert runner.pipeline.forward_calls == 1
     assert record_names == ["pipeline_memory_profile"]
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
@@ -569,7 +584,14 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
 
     runner.pipeline.denoise_step = denoise_step
     runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -586,6 +608,8 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     assert observed_batch_rows == [(2, 2)]
     assert runner.state_cache == {}
     assert runner.input_batch is None
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
@@ -819,9 +843,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
             del kwargs
             return SimpleNamespace(transformer=torch.nn.Identity())
 
-        def take_host_weight_plan(self):
-            return None
-
     class _DummyMemoryProfiler:
         consumed_memory = 0
 
@@ -863,8 +884,8 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
     monkeypatch.setattr(
         model_runner_module,
-        "get_offload_backend",
-        lambda od_config, device, host_weight_plan: None,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device: (pipeline, None),
     )
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
@@ -877,8 +898,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert dummy_cache_backend.enabled is False
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
     import vllm.config.vllm as vllm_config_module
