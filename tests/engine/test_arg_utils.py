@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Omni config utils. For stability, these tests should largely be
 invariant to the specific attributes of vLLM config except in cases where we
@@ -8,6 +11,8 @@ import inspect
 import json
 import os
 import shutil
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -21,6 +26,8 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,6 +36,11 @@ def test_sync_config_is_omni():
     """Ensure create_model_config gives the right type."""
     cfg = OmniEngineArgs().create_model_config()
     assert isinstance(cfg, OmniModelConfig)
+
+
+def test_session_mode_reaches_omni_model_config():
+    assert OmniEngineArgs().create_model_config().session_mode == "turn"
+    assert OmniEngineArgs(session_mode="duplex").create_model_config().session_mode == "duplex"
 
 
 def test_default_stage_id_is_concrete_int():
@@ -43,7 +55,102 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_multimodal_kwarg_overrides(mocker):
+def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
+    """Keep the pipeline capability intact through the engine adapter."""
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+    worker_module = types.ModuleType("test_connector_worker")
+
+    class ConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class ConnectorWorker:
+        model_runner_cls = ConnectorRunner
+
+    worker_module.ConnectorWorker = ConnectorWorker
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda _self: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+
+    def capture_omni_config(_cls, model_config, **omni_kwargs):
+        assert model_config is baseline_config
+        captured.update(omni_kwargs)
+        return baseline_config
+
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(capture_omni_config),
+    )
+
+    OmniEngineArgs(
+        stage_id=1,
+        requires_full_payload_input=True,
+        worker_cls="test_connector_worker.ConnectorWorker",
+    ).create_model_config()
+
+    assert captured["requires_full_payload_input"] is True
+
+
+def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
+    worker_module = types.ModuleType("test_async_scheduler_worker")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    args = OmniEngineArgs(
+        stage_id=1,
+        async_chunk=True,
+        worker_cls="test_async_scheduler_worker.WorkerWithoutConnector",
+    )
+
+    assert args.requires_full_payload_input is False
+
+
+def test_full_payload_capability_requires_selected_worker_connector(monkeypatch):
+    worker_module = types.ModuleType("test_worker_without_connector")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+    with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
+        OmniEngineArgs(
+            stage_id=1,
+            requires_full_payload_input=True,
+            worker_cls="test_worker_without_connector.WorkerWithoutConnector",
+        )
+
+
+def test_full_payload_capability_validates_platform_selected_worker(monkeypatch):
+    worker_module = types.ModuleType("test_platform_worker_without_connector")
+
+    class WorkerWithoutConnector:
+        model_runner_cls = object
+
+    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+    monkeypatch.setattr(
+        current_omni_platform,
+        "get_omni_ar_worker_cls",
+        lambda: "test_platform_worker_without_connector.WorkerWithoutConnector",
+    )
+
+    with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
+        OmniEngineArgs(
+            stage_id=1,
+            requires_full_payload_input=True,
+            worker_type="ar",
+        )
+
+
+def test_multimodal_kwarg_overrides(monkeypatch):
     """Ensure that overrides in the multimodal config are preserved."""
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
@@ -57,8 +164,8 @@ def test_multimodal_kwarg_overrides(mocker):
         assert self.mm_processor_cache_gb == override_val
         return fake_model_config
 
-    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
-    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+    monkeypatch.setattr(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    monkeypatch.setattr(OmniModelConfig, "from_vllm_model_config", lambda model_config, **_: model_config)
 
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
@@ -198,6 +305,7 @@ def test_missing_hf_config_is_synthesized_for_registered_code2wav(
         return baseline_config
 
     monkeypatch.setattr(EngineArgs, "create_model_config", fake_create_model_config)
+
     monkeypatch.setattr(
         OmniModelConfig,
         "from_vllm_model_config",
@@ -220,6 +328,28 @@ def test_missing_hf_config_is_synthesized_for_registered_code2wav(
         "model_type": "omni2_speech2s_qwen2",
     }
     assert captured["hf_config_path"] is not None
+
+
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+    """A successful remote tokenizer download must not enter the error path."""
+    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir.mkdir()
+    baseline_config = Mock()
+    warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    assert args.create_model_config() is baseline_config
+    assert args.tokenizer == str(tokenizer_dir)
+    warning.assert_not_called()
 
 
 def test_patch_missing_local_hf_config(tmp_path):

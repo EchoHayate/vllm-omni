@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -10,6 +11,8 @@ import vllm_omni.model_executor.models.llama_omni2.llama_omni2 as wrapper_module
 from vllm_omni.model_executor.models.llama_omni2.llama_omni2 import (
     Omni2Speech2SQwen2ForCausalLM,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeStage(nn.Module):

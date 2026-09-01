@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -13,6 +14,8 @@ from tests.e2e.offline_inference.llama_omni2.run_llama_omni2_e2e import (
     _requested_text_prompts,
     _require_multiple_audio_chunks,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_request_result_reads_audio_from_omni_output_property():

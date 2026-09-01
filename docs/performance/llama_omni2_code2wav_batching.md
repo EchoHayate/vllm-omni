@@ -22,7 +22,7 @@ The controlled end-to-end gate passed:
 ## Compared Revisions
 
 | Item | Revision or artifact |
-|---|---|
+| --- | --- |
 | Final upstream base | `8ecd1f6d5cc91aab8a475a861213720b336e2f65` |
 | Benchmark upstream base | `728640f4d9bb7c1b68d646e2a4c59ce1ce45de9c` |
 | Sequential reference source | Code2Wav and deploy content match `d15cd7dd`; Stage 2 was overridden to `max_num_seqs: 1` |
@@ -45,7 +45,7 @@ only modify MiniMax-H3 NPU files and do not overlap this PR's code paths.
 ## Environment
 
 | Component | Value |
-|---|---|
+| --- | --- |
 | Date | 2026-08-14 |
 | Host | `n232-195-203` |
 | GPUs | 2 × NVIDIA A100 80 GB PCIe |
@@ -121,7 +121,7 @@ standard deviation in parentheses. Relative change is after versus before;
 lower is better for TTFP and RTF, while higher is better for throughput.
 
 | Concurrency | Metric | Before | After | Relative change |
-|---:|---|---:|---:|---:|
+| ---: | --- | ---: | ---: | ---: |
 | 1 | median audio TTFP (ms) | 161.63 (19.67) | 160.36 (4.75) | -0.79% |
 | 1 | median audio RTF | 11.6339 (0.6680) | 10.5359 (0.0401) | -9.44% |
 | 1 | audio throughput | 0.08363 (0.00403) | 0.09474 (0.00045) | +13.28% |
@@ -139,7 +139,7 @@ alone, is used as the primary performance claim.
 ### Gate Decision
 
 | Gate | Requirement | Result |
-|---|---|---|
+| --- | --- | --- |
 | c1 TTFP | regression no greater than 5% | PASS, `-0.79%` |
 | c1 RTF | regression no greater than 5% | PASS, `-9.44%` |
 | c4 or c8 throughput/RTF | at least 10% improvement | PASS, c4 throughput `+28.90%`, c8 throughput `+70.30%` |
@@ -182,7 +182,7 @@ run disabled TF32 and cuDNN benchmarking, enabled deterministic algorithms,
 and supplied the same request-stable CFM noise to every row.
 
 | Field | Result |
-|---|---:|
+| --- | ---: |
 | Sample rate | 24,000 Hz |
 | Output samples per request | 30,720 |
 | Finite samples per request | 30,720 |
@@ -203,7 +203,7 @@ run. Profiling used a short scheduled window with shape recording disabled to
 avoid the memory growth observed when profiling the complete request.
 
 | Range | batch=1 count | batch=2 count |
-|---|---:|---:|
+| --- | ---: | ---: |
 | `llama_omni2.code2wav.flow` | 20 | 20 |
 | `llama_omni2.code2wav.hift` | 20 | 20 |
 | `llama_omni2.code2wav.d2h` | 19 | 19 |

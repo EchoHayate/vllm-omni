@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ from vllm_omni.model_executor.models.llama_omni2.llama_omni2_code2wav import (
     load_default_speaker_embedding,
     validate_cosy2_decoder_dir,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeFlow(nn.Module):

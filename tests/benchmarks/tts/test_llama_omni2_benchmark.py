@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import json
@@ -13,6 +16,7 @@ sys.path.insert(0, str(_REPO_ROOT / "benchmarks" / "tts"))
 import bench_tts  # noqa: E402
 
 _CONFIG = _REPO_ROOT / "benchmarks" / "tts" / "model_configs.yaml"
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
 def test_llama_omni2_uses_openai_chat_omni_backend() -> None:

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import re
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -14,6 +16,22 @@ from vllm_omni.model_executor.models.llama_omni2.llama_omni2_talker import (
     TALKER_WEIGHTS_MAPPER,
     LlamaOmni2TalkerForConditionalGeneration,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vLLM linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old_tp = parallel_state._TP
+    parallel_state._TP = mock_tp
+    try:
+        yield
+    finally:
+        parallel_state._TP = old_tp
 
 
 def test_talker_projection_and_gate_match_checkpoint_shapes(init_fake_tp_group):

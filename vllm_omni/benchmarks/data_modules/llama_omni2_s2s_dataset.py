@@ -1,12 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-import base64
 import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pybase64 as base64
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer

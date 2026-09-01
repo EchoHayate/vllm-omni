@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.llama_omni2.llama_omni2_code2wav import (
@@ -19,6 +21,8 @@ from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
     talker2code2wav_async_chunk,
     thinker2talker_async_chunk,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Request:

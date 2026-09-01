@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import hashlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.e2e.offline_inference.llama_omni2.worker_extension import (
     LlamaOmni2ValidationWorkerExtension,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_validation_worker_reports_only_local_qwen2_parameter_shapes(

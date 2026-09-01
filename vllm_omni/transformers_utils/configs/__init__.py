@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Custom model configs that cannot be expressed via HuggingFace Transformers alone,
 following the same pattern as vllm.transformers_utils.configs.
@@ -24,6 +24,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "DotsTTSConfig": "vllm_omni.transformers_utils.configs.dots_tts",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -31,6 +32,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
@@ -48,6 +50,7 @@ __all__ = [
     "DotsTTSConfig",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "MiniMaxMusic3Config",
     "OmniVoiceConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
@@ -55,6 +58,7 @@ __all__ = [
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
+    "SenseNovaU1Config",
 ]
 
 
@@ -81,6 +85,8 @@ from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_
 from vllm_omni.transformers_utils.configs import llama_omni2 as _llama_omni2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

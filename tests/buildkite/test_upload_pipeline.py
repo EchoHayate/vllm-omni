@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import sys
@@ -39,8 +40,6 @@ def _render(changed_files: list[str]) -> str:
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
-    import yaml
-
     rendered = _render_bootstrap_pipeline(
         BOOTSTRAP_STEPS_TEMPLATE,
         decision=resolve_ci_decision([]),
@@ -63,21 +62,41 @@ def test_bootstrap_steps_loaded_from_file() -> None:
 
 
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
-    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 still gates scheduled CI."""
+    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
     assert "key: upload-nightly-pipeline" in rendered
     assert "key: upload-weekly-pipeline" in rendered
-    # Scheduled nightly also uploads L2/L3 with --e2e
-    assert "key: upload-ready-pipeline" in rendered
-    assert "key: upload-merge-pipeline" in rendered
-    assert 'build.env("NIGHTLY") == "1"' in rendered
+    # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
+    assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
     assert "weekly-test" not in rendered
     assert "merge-test" not in rendered
     assert 'labels includes "ready"' not in rendered
     assert "if: false" not in rendered
+
+
+def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
+    """NPU skip_all: scheduled NIGHTLY still uploads L4, not L2 ready."""
+    rendered = _render_bootstrap_pipeline(
+        BOOTSTRAP_STEPS_TEMPLATE,
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "upload-ready-pipeline" not in by_key
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
@@ -142,12 +161,7 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     ]
 
 
-COVERAGE_PILOT_LABELS = ("Diffusion · Bagel Test", "TTS · Qwen3-TTS Base Test")
-MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
-
-
-def _surviving_labels(changed_files: list[str]) -> set[str]:
-    doc = yaml.safe_load(MERGE_PIPELINE.read_text(encoding="utf-8"))
+def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
     rendered = _render_test_pipeline(doc, changed_files=changed_files)
     labels: set[str] = set()
 
@@ -163,6 +177,29 @@ def _surviving_labels(changed_files: list[str]) -> set[str]:
     return labels
 
 
+# Synthetic coverage-style job: shared inputs that change what the split measures.
+_COVERAGE_SHARED_INPUTS_DOC = {
+    "steps": [
+        {
+            "label": "Coverage Pilot",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_example.py",
+                ".buildkite/common/scripts/run_cov_split.sh",
+                "pyproject.toml",
+            ],
+            "commands": [".buildkite/common/scripts/run_cov_split.sh --model-id example"],
+        },
+        {
+            "label": "Unrelated Model Test",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_other.py",
+            ],
+            "commands": ["pytest -sv tests/e2e/online_serving/test_other.py"],
+        },
+    ],
+}
+
+
 @pytest.mark.parametrize(
     "changed_file",
     [
@@ -170,18 +207,17 @@ def _surviving_labels(changed_files: list[str]) -> set[str]:
         "pyproject.toml",
     ],
 )
-def test_coverage_pilots_selected_by_their_shared_inputs(changed_file: str) -> None:
-    """The split helper and the coverage config both change what these jobs measure.
-
-    Without them in source_file_dependencies the jobs are filtered out of normal
-    PR builds, so a regression would only surface in a later nightly.
-    """
-    labels = _surviving_labels([changed_file])
-    for pilot in COVERAGE_PILOT_LABELS:
-        assert pilot in labels, f"{pilot} dropped when {changed_file} changed"
+def test_coverage_shared_inputs_select_dependent_job(changed_file: str) -> None:
+    """Jobs that list coverage shared inputs must stay selected when those files change."""
+    labels = _surviving_labels(_COVERAGE_SHARED_INPUTS_DOC, [changed_file])
+    assert "Coverage Pilot" in labels
+    assert "Unrelated Model Test" not in labels
 
 
-def test_coverage_pilots_not_selected_by_unrelated_change() -> None:
-    labels = _surviving_labels(["vllm_omni/entrypoints/openai/serving_chat.py"])
-    for pilot in COVERAGE_PILOT_LABELS:
-        assert pilot not in labels
+def test_coverage_shared_inputs_ignored_for_unrelated_change() -> None:
+    labels = _surviving_labels(
+        _COVERAGE_SHARED_INPUTS_DOC,
+        ["vllm_omni/entrypoints/openai/serving_chat.py"],
+    )
+    assert "Coverage Pilot" not in labels
+    assert "Unrelated Model Test" not in labels

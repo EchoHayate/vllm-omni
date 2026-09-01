@@ -4,14 +4,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from PIL import Image
 
-from vllm_omni.model_extras.audiox import (
-    AUDIOX_EXTRA_BODY_PARAMS,
-    AUDIOX_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -34,10 +30,11 @@ from vllm_omni.model_extras.helios import (
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
-from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
-from vllm_omni.model_extras.magi_human import (
-    MAGI_HUMAN_EXTRA_BODY_PARAMS,
-    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+from vllm_omni.model_extras.ltx2 import (
+    LTX_EXTRA_BODY_PARAMS,
+    LTX_EXTRA_OUTPUT_PARAMS,
+    ltx_preserves_reference_image_size,
+    ltx_transformer_config_subfolder,
 )
 from vllm_omni.model_extras.mammothmodal2_preview import (
     MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
@@ -61,6 +58,7 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -94,6 +92,24 @@ ImageToVideoPromptBuilder = Callable[
 ]
 XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
 OutputTensorRange = Literal["negative_one_to_one", "zero_to_one"]
+
+
+class ReferenceImageSizeResolver(Protocol):
+    def __call__(
+        self,
+        *,
+        model: str | None,
+        revision: str | None = None,
+    ) -> bool: ...
+
+
+class TransformerConfigSubfolderResolver(Protocol):
+    def __call__(
+        self,
+        *,
+        model: str | None,
+        revision: str | None = None,
+    ) -> str: ...
 
 
 def default_x_to_text_prompt(
@@ -156,10 +172,6 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
-    "AudioXPipeline": {
-        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
-        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
-    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -180,10 +192,6 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
-    "MagiHumanPipeline": {
-        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
-    },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -202,12 +210,21 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         model_class_name: {
             "extra_body_params": LTX_EXTRA_BODY_PARAMS,
             "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+            "reference_image_size_resolver": ltx_preserves_reference_image_size,
         }
         for model_class_name in (
             "LTX2Pipeline",
             "LTX2TwoStagePipeline",
+            "LTX2DistilledOneStagePipeline",
             "LTX2DistilledPipeline",
+            "LTX2DistilledTwoStagePipeline",
         )
+    },
+    "SanaVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "SanaImageToVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
@@ -228,6 +245,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
 }
+
+for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
+    _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
+
 
 # Multi-stage discovery reports the top-level wrapper rather than its DiT
 # submodule, so both names must resolve to the same request builders.
@@ -275,6 +296,36 @@ def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
     if spec is None:
         return "negative_one_to_one"
     return spec.get("output_tensor_range", "negative_one_to_one")
+
+
+def get_transformer_config_subfolder(
+    model_class_name: str | None,
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> str:
+    """Return the model-declared DiT config subfolder, or the standard default."""
+    spec = _get_spec(model_class_name)
+    resolver: TransformerConfigSubfolderResolver | None = (
+        spec.get("transformer_config_subfolder_resolver") if spec else None
+    )
+    return resolver(model=model, revision=revision) if resolver else "transformer"
+
+
+def should_preserve_reference_image_size(
+    model_class_name: str | None,
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> bool:
+    """Return whether the selected pipeline owns reference-image resizing."""
+    if model_class_name is None and model is not None:
+        from vllm_omni.diffusion.data import resolve_model_class_name
+
+        model_class_name = resolve_model_class_name(model, revision=revision)
+    spec = _get_spec(model_class_name)
+    resolver: ReferenceImageSizeResolver | None = spec.get("reference_image_size_resolver") if spec else None
+    return bool(resolver and resolver(model=model, revision=revision))
 
 
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:

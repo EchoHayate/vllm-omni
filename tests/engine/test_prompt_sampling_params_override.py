@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -9,6 +10,8 @@ from vllm_omni.engine.orchestrator import (
     Orchestrator,
     build_engine_core_request_from_tokens,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_token_prompt_sampling_override_is_request_local():

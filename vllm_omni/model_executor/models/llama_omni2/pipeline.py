@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """LLaMA-Omni 2 three-stage speech-to-speech pipeline."""
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability

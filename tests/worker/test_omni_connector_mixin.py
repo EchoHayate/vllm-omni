@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniConnectorModelRunnerMixin.
 
 These tests use a mock connector (in-memory dict store) and do not require
@@ -21,9 +21,9 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
 from vllm_omni.outputs import OmniConnectorOutput
-from vllm_omni.worker.gpu_ar_model_runner import _should_init_runner_omni_connectors
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -87,43 +87,45 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     pass
 
 
-def test_async_chunk_uses_scheduler_owned_connector_only() -> None:
+def test_async_chunk_receiver_initializes_explicit_connector() -> None:
     model_config = SimpleNamespace(
         async_chunk=True,
-        model_arch="Omni2Speech2SQwen2ForCausalLM",
-        architectures=["Omni2Speech2SQwen2ForCausalLM"],
         stage_connector_config={
             "name": "SharedMemoryConnector",
             "extra": {"role": "receiver"},
         },
+        custom_process_next_stage_input_func=None,
+        requires_full_payload_input=False,
     )
 
-    assert _should_init_runner_omni_connectors(model_config) is False
+    assert needs_omni_connector(model_config) is True
 
 
 def test_sync_full_payload_keeps_runner_owned_connector() -> None:
     model_config = SimpleNamespace(
         async_chunk=False,
-        model_arch="Omni2Speech2SQwen2ForCausalLM",
-        architectures=["Omni2Speech2SQwen2ForCausalLM"],
         stage_connector_config={
             "name": "SharedMemoryConnector",
             "extra": {"role": "receiver"},
         },
+        custom_process_next_stage_input_func=None,
+        requires_full_payload_input=False,
     )
 
-    assert _should_init_runner_omni_connectors(model_config) is True
+    assert needs_omni_connector(model_config) is True
 
 
-def test_llama_omni2_sync_thinker_initializes_output_connector() -> None:
+def test_full_payload_producer_initializes_output_connector() -> None:
     model_config = SimpleNamespace(
         async_chunk=False,
-        model_arch="Omni2Speech2SQwen2ForCausalLM",
-        architectures=["Omni2Speech2SQwen2ForCausalLM"],
         stage_connector_config=None,
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.llama_omni2.thinker2talker_full_payload"
+        ),
+        requires_full_payload_input=False,
     )
 
-    assert _should_init_runner_omni_connectors(model_config) is True
+    assert needs_omni_connector(model_config) is True
 
 
 class _FakeTPGroup:

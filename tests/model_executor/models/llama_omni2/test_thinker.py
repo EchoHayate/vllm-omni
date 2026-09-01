@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -18,6 +19,8 @@ from vllm_omni.model_executor.models.llama_omni2.llama_omni2_thinker import (
     speech_placeholder_token_ids,
     splice_speech_embeddings,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_encoder_projector_discards_incomplete_frame_groups():

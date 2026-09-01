@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
 import torch
 
 from tests.e2e.offline_inference.llama_omni2.verify_tp_shards import (
     build_expected_local_parameters,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_build_expected_local_parameters_matches_qwen2_tp_layout():

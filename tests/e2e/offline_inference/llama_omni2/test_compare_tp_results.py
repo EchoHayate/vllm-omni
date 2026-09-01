@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 
@@ -9,6 +10,8 @@ import soundfile as sf
 from tests.e2e.offline_inference.llama_omni2.compare_tp_results import (
     compare_results,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _write_result(tmp_path, name: str, codec_token_ids: list[int]):

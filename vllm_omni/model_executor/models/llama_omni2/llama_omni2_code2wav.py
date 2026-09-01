@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice2 code-to-waveform stage for LLaMA-Omni 2."""
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.transformers_utils.repo_utils import hf_api
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -72,9 +73,7 @@ def _resolve_decoder_dir(model: str) -> Path:
     if local.is_dir():
         return validate_cosy2_decoder_dir(local)
 
-    from huggingface_hub import snapshot_download
-
-    return validate_cosy2_decoder_dir(snapshot_download(model))
+    return validate_cosy2_decoder_dir(hf_api().snapshot_download(model))
 
 
 def _load_cosy2_modules(
