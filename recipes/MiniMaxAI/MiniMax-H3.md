@@ -936,10 +936,20 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
 export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 ```
 
-Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
-command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
-correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
-fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command. For a
+single GPU, the Dense / Data-Free variant may be combined with model-level CPU
+offload:
+
+```bash
+--num-gpus 1 \
+--task-type fl2va \
+--enable-cpu-offload \
+--lora-path "${FASTH3_LORA}"
+```
+
+T2VA is served by the FL2VA partition, so `--task-type fl2va` is correct even
+though FastH3 preview v1 distills T2VA only. Because the adapter is fused,
+`--lora-backend` does not apply and a request carrying a `lora=` field is
 rejected rather than served without the adapter it asked for.
 
 ```bash
@@ -958,9 +968,19 @@ Only a release that identifies itself as FastH3 is fused; any other
 `fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
 is then held to its own metadata: one that misdeclares its tensor counts or
 leaves a transformer block unedited is refused at startup instead of serving
-mostly base H3 weights on a four-step schedule. Offload is refused for the same
-reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
-`--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
+mostly base H3 weights on a four-step schedule. Model-level CPU offload remains
+compatible because it uses the ordinary checkpoint loader, completes FastH3
+fusion and validation, and only then installs the offloader. Standard
+`--enable-layerwise-offload` and `--enable-distributed-layerwise-offload` can
+bypass that loading path, so they continue to fail fast. VSA plus model-level
+CPU offload is also rejected until that combination receives its own
+device-level validation.
+
+When model-level CPU offload loads the base parameters on CPU, FastH3 computes
+each delta on the accelerator and copies the fused result back to the CPU
+parameter before serving. This is startup-only traffic; allow extra startup
+time and transient device memory compared with loading the already-fused
+checkpoint.
 
 The VSA variants are supported through FastVideo's external kernel. Install a
 `fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
