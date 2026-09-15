@@ -43,6 +43,7 @@ class BlockCase:
     use_conv: bool = False
     up: bool = False
     down: bool = False
+    emb_channels: int = 512
 
 
 CASES = {
@@ -52,6 +53,8 @@ CASES = {
     "convolutional_skip": BlockCase(1, 128, 256, 16, 16, use_conv=True),
     "production_down_branch": BlockCase(1, 128, 128, 32, 32, down=True),
     "production_up_branch": BlockCase(1, 128, 128, 16, 16, up=True),
+    "production_patch_embed": BlockCase(1, 1024, 4096, 64, 64, emb_channels=4096),
+    "production_final_layer": BlockCase(1, 4096, 1024, 64, 64, emb_channels=4096),
 }
 
 
@@ -121,7 +124,7 @@ def _require_triton_fused_ops() -> None:
 def _constructor_kwargs(case: BlockCase, dtype: torch.dtype) -> dict[str, object]:
     return {
         "in_channels": case.in_channels,
-        "emb_channels": 512,
+        "emb_channels": case.emb_channels,
         "out_channels": case.out_channels,
         "dropout": 0.0,
         "use_conv": case.use_conv,
@@ -181,7 +184,7 @@ def _make_inputs(case: BlockCase, dtype: torch.dtype) -> tuple[torch.Tensor, tor
     ).to(dtype)
     emb = torch.randn(
         case.batch,
-        512,
+        case.emb_channels,
         generator=generator,
         device="cuda",
         dtype=torch.float32,
@@ -234,6 +237,16 @@ def _git_head() -> str:
     return result.stdout.strip()
 
 
+def _source_provenance() -> dict[str, str]:
+    import vllm_omni
+
+    return {
+        "commit": _git_head(),
+        "benchmark_file": str(Path(__file__).resolve()),
+        "vllm_omni_file": str(Path(vllm_omni.__file__).resolve()),
+    }
+
+
 def _run(args: argparse.Namespace) -> dict[str, object]:
     dtype = _DTYPES[args.dtype]
     case = CASES[args.case]
@@ -279,7 +292,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
 
     return {
         "scope": "HunyuanImage3 ResBlock block-level only",
-        "commit": _git_head(),
+        **_source_provenance(),
         "gpu": current_omni_platform.get_device_name(),
         "torch_version": torch.__version__,
         "accelerator_version": current_omni_platform.get_device_version(),

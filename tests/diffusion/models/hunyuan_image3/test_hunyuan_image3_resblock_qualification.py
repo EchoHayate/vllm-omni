@@ -57,6 +57,7 @@ class BlockCase:
     use_conv: bool = False
     up: bool = False
     down: bool = False
+    emb_channels: int = 512
 
 
 _CASES = (
@@ -66,6 +67,10 @@ _CASES = (
     BlockCase("convolutional_skip", 1, 128, 256, 16, 16, use_conv=True),
     BlockCase("production_down_branch", 1, 128, 128, 32, 32, down=True),
     BlockCase("production_up_branch", 1, 128, 128, 16, 16, up=True),
+)
+_PRODUCTION_BF16_CASES = (
+    BlockCase("production_patch_embed", 1, 1024, 4096, 64, 64, emb_channels=4096),
+    BlockCase("production_final_layer", 1, 4096, 1024, 64, 64, emb_channels=4096),
 )
 
 
@@ -110,7 +115,7 @@ def _require_triton_fused_ops() -> None:
 def _constructor_kwargs(case: BlockCase, dtype: torch.dtype) -> dict[str, object]:
     return {
         "in_channels": case.in_channels,
-        "emb_channels": 512,
+        "emb_channels": case.emb_channels,
         "out_channels": case.out_channels,
         "dropout": 0.0,
         "use_conv": case.use_conv,
@@ -164,7 +169,7 @@ def _make_inputs(case: BlockCase, dtype: torch.dtype) -> tuple[torch.Tensor, tor
     ).to(dtype)
     emb = torch.randn(
         case.batch,
-        512,
+        case.emb_channels,
         generator=generator,
         device="cuda",
         dtype=torch.float32,
@@ -231,14 +236,45 @@ def test_native_and_nvidia_resblocks_match_under_autocast(autocast_dtype: torch.
     torch.testing.assert_close(nvidia_output, native_output, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("case", _PRODUCTION_BF16_CASES, ids=lambda case: case.name)
+def test_production_bf16_resblocks_match(case: BlockCase) -> None:
+    dtype = torch.bfloat16
+    native, nvidia = _make_blocks(case, dtype)
+    inputs, embedding = _make_inputs(case, dtype)
+
+    assert embedding.shape == (case.batch, 4096)
+    assert tuple(native.state_dict()) == tuple(nvidia.state_dict())
+    assert native.skip_connection.kernel_size == nvidia.skip_connection.kernel_size == (1, 1)
+    with torch.inference_mode():
+        native_output = native(inputs, embedding)
+        nvidia_output = nvidia(inputs, embedding)
+        skip_output = native.skip_connection(inputs)
+
+    assert native_output.shape == nvidia_output.shape == (case.batch, case.out_channels, 64, 64)
+    assert native_output.dtype == nvidia_output.dtype == dtype
+    assert torch.isfinite(native_output).all()
+    assert torch.isfinite(nvidia_output).all()
+    assert (native_output - skip_output).abs().max().item() > 1e-4
+    rtol, atol = _TOLERANCES[dtype]
+    torch.testing.assert_close(nvidia_output, native_output, rtol=rtol, atol=atol)
+
+
 def test_cuda_dispatch_selects_nvidia_resblock() -> None:
     assert selected_layers.ResBlock is NvidiaResBlock
 
 
-def test_nvidia_resblock_calls_both_fused_operations(monkeypatch: pytest.MonkeyPatch) -> None:
-    case = _CASES[0]
-    native, nvidia = _make_blocks(case, torch.float32)
-    x, emb = _make_inputs(case, torch.float32)
+@pytest.mark.parametrize(
+    ("case", "dtype"),
+    (
+        pytest.param(_CASES[0], torch.float32, id="identity-float32"),
+        *(pytest.param(case, torch.bfloat16, id=case.name) for case in _PRODUCTION_BF16_CASES),
+    ),
+)
+def test_nvidia_resblock_calls_both_fused_operations(
+    case: BlockCase, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, nvidia = _make_blocks(case, dtype)
+    x, emb = _make_inputs(case, dtype)
     calls = {"group_norm": 0, "adaptive_group_norm": 0}
     original_group_norm = nvidia_blocks.fused_group_norm_silu
     original_adaptive = nvidia_blocks.fused_adaptive_group_norm_silu
