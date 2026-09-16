@@ -50,6 +50,7 @@ def _init_single_rank_tp_env():
             rank=0,
             local_rank=0,
             distributed_init_method="env://",
+            backend="gloo",
         )
         initialize_model_parallel()
         yield
@@ -74,7 +75,8 @@ def test_sensenova_lora_manager_scans_fm_modules():
 
 
 def test_sensenova_fm_head_preserves_checkpoint_weight_names():
-    pipeline = torch.nn.Module()
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    torch.nn.Module.__init__(pipeline)
     pipeline.fm_modules = torch.nn.ModuleDict(
         {"fm_head": _build_fm_head(input_dim=8, intermediate_dim=16, output_dim=12)}
     )
@@ -85,7 +87,7 @@ def test_sensenova_fm_head_preserves_checkpoint_weight_names():
         "fm_modules.fm_head.2.bias": torch.randn(12),
     }
 
-    loaded = SenseNovaU1Pipeline.load_weights(pipeline, weights.items())
+    loaded = pipeline.load_weights(weights.items())
 
     assert loaded == set(weights)
     for name, parameter in pipeline.named_parameters():
