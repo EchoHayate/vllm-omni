@@ -41,6 +41,7 @@ class _OffloadConfig:
     enable_distributed_layerwise_offload: bool = False
     diffusion_attention_backend: str = ""
     parallel_config: object | None = None
+    diffusion_offload_config: dict[str, object] | None = None
 
 
 def _factors(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -422,20 +423,40 @@ def test_a_request_may_not_carry_a_lora_on_a_fused_server(tmp_path):
         _check_request(fusion, _sampling(lora_request=SimpleNamespace(lora_int_id=1)))
 
 
-def test_model_cpu_offload_keeps_checkpoint_fusion_enabled(tmp_path):
+@pytest.mark.parametrize(
+    "offload_kwargs",
+    [
+        pytest.param({"enable_cpu_offload": True}, id="legacy"),
+        pytest.param(
+            {"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}},
+            id="compact",
+        ),
+    ],
+)
+def test_model_cpu_offload_keeps_checkpoint_fusion_enabled(offload_kwargs, tmp_path):
     fusion = _fusion(tmp_path)
 
     # Model-level CPU offload is installed after the ordinary checkpoint load,
     # so FastH3 still fuses every adapter delta and validates completeness.
     fusion.check_serving_contract(
         partition="fl2va",
-        od_config=_OffloadConfig(enable_cpu_offload=True),
+        od_config=_OffloadConfig(**offload_kwargs),
         video_shift=12.0,
         audio_shift=3.0,
     )
 
 
-def test_model_cpu_offload_remains_dense_only(tmp_path):
+@pytest.mark.parametrize(
+    "offload_kwargs",
+    [
+        pytest.param({"enable_cpu_offload": True}, id="legacy"),
+        pytest.param(
+            {"diffusion_offload_config": {"mode": "module", "components": ["dit", "text_encoder"]}},
+            id="compact",
+        ),
+    ],
+)
+def test_model_cpu_offload_remains_dense_only(offload_kwargs, tmp_path):
     sparse = tmp_path / "vsa" / "adapter_model.safetensors"
     _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
 
@@ -443,8 +464,8 @@ def test_model_cpu_offload_remains_dense_only(tmp_path):
         _load(sparse.parent).check_serving_contract(
             partition="fl2va",
             od_config=_OffloadConfig(
-                enable_cpu_offload=True,
                 diffusion_attention_backend="FASTVIDEO_VSA",
+                **offload_kwargs,
             ),
             video_shift=12.0,
             audio_shift=3.0,
@@ -456,6 +477,30 @@ def test_model_cpu_offload_remains_dense_only(tmp_path):
     [
         pytest.param(_OffloadConfig(enable_layerwise_offload=True), id="layerwise"),
         pytest.param(_OffloadConfig(enable_distributed_layerwise_offload=True), id="distributed-layerwise"),
+        pytest.param(
+            _OffloadConfig(diffusion_offload_config={"mode": "layer", "components": ["dit"]}),
+            id="compact-layerwise",
+        ),
+        pytest.param(
+            _OffloadConfig(
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                }
+            ),
+            id="compact-distributed-allgather",
+        ),
+        pytest.param(
+            _OffloadConfig(
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "rank-local", "resident_layers": 1}},
+                }
+            ),
+            id="compact-distributed-resident-layers",
+        ),
     ],
 )
 def test_layerwise_offload_is_refused_because_it_bypasses_the_fusion(offload_config, tmp_path):

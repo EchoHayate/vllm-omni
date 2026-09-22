@@ -603,23 +603,21 @@ class FastH3WeightFusion:
         audio_shift: float,
     ) -> None:
         """Hold a starting server to the ladder this student was trained on."""
+        from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
+
         if partition == "ref2va":
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
-        offloads = [
-            flag
-            for flag in ("enable_layerwise_offload", "enable_distributed_layerwise_offload")
-            if getattr(od_config, flag, False)
-        ]
-        if offloads:
+        offload_strategy = resolve_offload(od_config).strategy
+        if offload_strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE):
             # Layerwise host-weight paths can install the transformer without
             # going through load_weights(), which is where the fusion and its
             # completeness check live. Model-level CPU offload is installed
             # only after ordinary loading and is therefore compatible.
             raise ValueError(
                 f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{sorted(offloads)}. Use model-level CPU offload or serve it without offload."
+                f"{offload_strategy.value}. Use model-level CPU offload or serve it without offload."
             )
-        if self.requires_vsa and getattr(od_config, "enable_cpu_offload", False):
+        if self.requires_vsa and offload_strategy is OffloadStrategy.MODEL_LEVEL:
             raise ValueError(
                 "FastH3 model-level CPU offload currently supports only the Dense / Data-Free variant; "
                 "serve VSA without offload."
