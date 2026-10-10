@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -226,7 +226,6 @@ def llm2audio_vae_async_chunk(
     request_id = request.external_req_id
     chunk_id = int(transfer_manager.put_req_chunk[request_id])
     finished = bool(is_finished or request.is_finished())
-    patch, final_decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
     request_payload = transfer_manager.request_payload
     request_state = request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_ming_async_state" not in request_state:
@@ -241,6 +240,7 @@ def llm2audio_vae_async_chunk(
     if bool(state.get("terminal_sent", False)):
         return None
 
+    patch, final_decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
     if patch is not None:
         transfer_manager.code_prompt_token_ids[request_id].append(patch)
 
