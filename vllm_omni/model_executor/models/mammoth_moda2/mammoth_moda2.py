@@ -192,14 +192,15 @@ def moe_forward(
     # 1.2 Understanding tokens (False)
     und_out = und_expert(und_hid)  # (N_und, D)
     out_dim = und_out.shape[-1]
+    output_dtype = torch.promote_types(gen_out.dtype, und_out.dtype)
 
     merged = torch.empty(
         (total_tokens, out_dim),
-        dtype=und_out.dtype,
+        dtype=output_dtype,
         device=und_out.device,
     )
-    merged.index_copy_(0, gen_pos, gen_out)
-    merged.index_copy_(0, und_pos, und_out)
+    merged.index_copy_(0, gen_pos, gen_out.to(dtype=output_dtype))
+    merged.index_copy_(0, und_pos, und_out.to(dtype=output_dtype))
 
     if hidden_states.ndim == 2:
         return merged.view(total_tokens, out_dim).contiguous()

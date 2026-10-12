@@ -94,6 +94,41 @@ def test_moe_forward_mask_fallback_preserves_existing_api():
     torch.testing.assert_close(output, expected)
 
 
+@pytest.mark.parametrize("shape", [(6, 4), (2, 3, 4)])
+@pytest.mark.parametrize("routing_mode", ["mask", "precomputed", "both"])
+@pytest.mark.parametrize("und_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("gen_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_moe_forward_preserves_expert_output_dtype_promotion(shape, routing_mode, und_dtype, gen_dtype):
+    hidden_states = torch.arange(24, dtype=torch.float32).reshape(shape) / 7
+    mask = torch.tensor([False, True, False, True, True, False]).reshape(shape[:-1])
+
+    def understanding(states):
+        return (states[..., :3] + 10).to(und_dtype)
+
+    def generation(states):
+        return (states[..., :3] * 2).to(gen_dtype)
+
+    output = moe_forward(
+        hidden_states,
+        understanding,
+        generation,
+        mask if routing_mode != "precomputed" else None,
+        token_routing=_build_moe_token_routing(mask) if routing_mode != "mask" else None,
+    )
+
+    flat_hidden_states = hidden_states.reshape(-1, shape[-1])
+    flat_mask = mask.reshape(-1)
+    gen_positions = torch.where(flat_mask)[0]
+    und_positions = torch.where(~flat_mask)[0]
+    inverse_order = torch.argsort(torch.cat([gen_positions, und_positions]))
+    expected = torch.cat([generation(flat_hidden_states[flat_mask]), understanding(flat_hidden_states[~flat_mask])])[
+        inverse_order
+    ].reshape(*shape[:-1], 3)
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert output.is_contiguous()
+
+
 def test_moe_forward_rejects_mask_shape_mismatch():
     with pytest.raises(ValueError, match="gen_token_mask shape mismatch"):
         moe_forward(
