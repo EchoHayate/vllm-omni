@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     PATCH_SIZE,
 )
 from vllm_omni.model_executor.models.ming_tts.patch_emission import (
+    MING_FINAL_DECODE_STEP_KEY,
     MING_STOP_REASON_CODES,
     MING_STOP_REASON_KEY,
 )
@@ -31,7 +32,6 @@ MING_EMIT_PATCH_COUNT_KEY = "ming_emit_patch_count"
 MING_LATENT_SHAPE_KEY = "ming_latent_shape"
 MING_ESTIMATED_BYTES_KEY = "ming_estimated_bytes"
 MING_FINAL_FLUSH_KEY = "ming_final_flush"
-MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 MING_STOP_REASON_BY_CODE = {code: reason for reason, code in MING_STOP_REASON_CODES.items()}
 
 
@@ -48,7 +48,7 @@ def _select_snapshot_value(value: Any, selected_index: int | torch.Tensor) -> An
     if isinstance(value, (list, tuple)):
         if not value:
             return None
-        value_index = int(selected_index.item()) if isinstance(selected_index, torch.Tensor) else selected_index
+        value_index = int(selected_index)
         return value[-1] if value_index < 0 else value[min(value_index, len(value) - 1)]
     return value
 

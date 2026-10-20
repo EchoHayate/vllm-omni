@@ -23,6 +23,7 @@ from vllm_omni.model_executor.stage_input_processors.ming_tts import (
     MING_LATENT_SHAPE_KEY,
     MING_STOP_REASON_KEY,
     _extract_ming_output_snapshot,
+    _select_snapshot_value,
     llm2audio_vae,
     llm2audio_vae_async_chunk,
 )
@@ -145,6 +146,34 @@ def test_ming_output_snapshot_preserves_list_metadata_fallback():
     assert stop_reason == "stop_head"
 
 
+@pytest.mark.parametrize("metadata_type", [list, tuple])
+@pytest.mark.parametrize("tensor_index", [False, True])
+@pytest.mark.parametrize(
+    ("selected_index", "expected"),
+    [(-4, 33), (-1, 33), (0, 11), (1, 22), (2, 33), (9, 33)],
+)
+def test_ming_snapshot_value_selects_sequence_with_standalone_index(
+    metadata_type, tensor_index, selected_index, expected
+):
+    index = torch.tensor(selected_index) if tensor_index else selected_index
+
+    assert _select_snapshot_value(metadata_type([11, 22, 33]), index) == expected
+
+
+@pytest.mark.parametrize("metadata_type", [list, tuple])
+@pytest.mark.parametrize("selected_index", [0, torch.tensor(0)])
+def test_ming_snapshot_value_preserves_empty_sequence(metadata_type, selected_index):
+    assert _select_snapshot_value(metadata_type(), selected_index) is None
+
+
+def test_ming_final_decode_step_key_is_shared_with_audio_vae():
+    from vllm_omni.model_executor.models.ming_tts import ming_tts_audio_vae, patch_emission
+
+    assert getattr(patch_emission, "MING_FINAL_DECODE_STEP_KEY", None) == "ming_final_decode_step"
+    assert MING_FINAL_DECODE_STEP_KEY == patch_emission.MING_FINAL_DECODE_STEP_KEY
+    assert ming_tts_audio_vae.MING_FINAL_DECODE_STEP_KEY == patch_emission.MING_FINAL_DECODE_STEP_KEY
+
+
 @pytest.mark.parametrize("all_patches", [False, True])
 @pytest.mark.parametrize("metadata_type", [list, tuple])
 def test_ming_output_snapshot_tensor_mask_selects_sequence_metadata_once(monkeypatch, all_patches, metadata_type):
@@ -156,17 +185,25 @@ def test_ming_output_snapshot_tensor_mask_selects_sequence_metadata_once(monkeyp
         MING_STOP_REASON_KEY: metadata_type([0, 1, 2]),
     }
     original_item = torch.Tensor.item
+    original_int = torch.Tensor.__int__
     item_calls = []
+    int_calls = []
 
     def counted_item(tensor, *args, **kwargs):
         item_calls.append(tensor)
         return original_item(tensor, *args, **kwargs)
 
+    def counted_int(tensor):
+        int_calls.append(tensor)
+        return original_int(tensor)
+
     with monkeypatch.context() as context:
         context.setattr(torch.Tensor, "item", counted_item)
+        context.setattr(torch.Tensor, "__int__", counted_int)
         selected, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output, all_patches=all_patches)
 
     assert len(item_calls) == int(all_patches)
+    assert not int_calls
     torch.testing.assert_close(selected, patches[:2] if all_patches else patches[1])
     assert decode_step == 22
     assert stop_reason == "stop_head"
